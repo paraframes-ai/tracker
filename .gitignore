@@ -1,0 +1,12 @@
+node_modules/
+*.log
+
+# Local machine config (each dev has their own)
+pf-sync.config.json
+
+# Trash folder the daemon moves remotely-deleted files into
+.pf-sync-trash/
+
+# macOS / Xcode noise
+.DS_Store
+DerivedData/

@@ -1,0 +1,26 @@
+{
+  "name": "paraframes-live",
+  "version": "0.1.0",
+  "description": "Real-time collaborative file sync for the ParaFrames SwiftUI app. A CRDT-based layer that lets two developers see each other's edits live while both keep using Xcode. Runs alongside git, not instead of it.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "pf-sync": "src/daemon.js",
+    "pf-relay": "src/relay.cjs"
+  },
+  "scripts": {
+    "relay": "node src/relay.cjs",
+    "sync": "node src/daemon.js"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "fast-diff": "^1.3.0",
+    "picomatch": "^4.0.2",
+    "ws": "^8.18.0",
+    "y-websocket": "^2.0.4",
+    "yjs": "^13.6.20"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,8 @@
+{
+  "//": "Copy to pf-sync.config.json and edit. 'relay', 'room' and 'token' MUST match your coworker's. 'root' and 'name' are per-machine.",
+  "relay": "wss://your-relay-host.example.com",
+  "room": "paraframes",
+  "token": "change-me-shared-secret",
+  "root": "/Users/you/dev/ParaFrames",
+  "name": "your-name"
+}
