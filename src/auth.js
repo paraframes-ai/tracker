@@ -13,7 +13,12 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-const GITHUB_CLIENT_ID = process.env.TRACKER_GITHUB_CLIENT_ID || '';
+// The client id is public by design: device flow has no client secret, and this
+// value ships inside every distributed binary. Overridable so self-hosters can
+// point at their own OAuth app.
+const DEFAULT_GITHUB_CLIENT_ID = 'Ov23liRkXOV0SuKwsR5M';
+
+const GITHUB_CLIENT_ID = process.env.TRACKER_GITHUB_CLIENT_ID || DEFAULT_GITHUB_CLIENT_ID;
 
 export function configDir() {
   const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
@@ -65,7 +70,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function githubDeviceFlow({ onPrompt }) {
   if (!GITHUB_CLIENT_ID) {
     throw new Error(
-      'no GitHub client id — set TRACKER_GITHUB_CLIENT_ID (see docs/rfc-001-hosted-relay.md §5)',
+      'no GitHub client id — this build has none compiled in; set ' +
+        'TRACKER_GITHUB_CLIENT_ID (see docs/rfc-001-hosted-relay.md §5)',
     );
   }
 
