@@ -8,6 +8,7 @@
 // The legacy self-hosted flags (--relay/--room/--token) still work via
 // `tracker sync`, which is the original daemon entry point unchanged.
 
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,10 +17,18 @@ import { clearAuth, devLogin, forgejoLogin, loadAuth, login, readSecretFromStdin
 import { fromBase64Url, generateRoomKey, toBase64Url } from './crypto.js';
 import { runSync } from './daemon.js';
 import { DEFAULT_EXCLUDE, DEFAULT_INCLUDE } from './config.js';
+import {
+  ensureStateDir,
+  listSessions,
+  logFile,
+  selfCommand,
+  stopSession,
+  writeSession,
+} from './session-state.js';
 
-// Not yet operational — RFC 001 §14 open question 2 (hosted domain and who
-// operates it). Override with --relay or PF_RELAY until that is settled.
-const DEFAULT_RELAY = process.env.PF_RELAY || 'wss://relay.paraframes.dev';
+// The hosted relay. Override with --relay or PF_RELAY to point at a self-hosted
+// one; `tracker login` stores whichever was used, so later commands inherit it.
+const DEFAULT_RELAY = process.env.PF_RELAY || 'wss://live.paraframes.org';
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
 
@@ -53,6 +62,52 @@ const syncDefaults = (flags, root) => ({
   include: DEFAULT_INCLUDE,
   exclude: DEFAULT_EXCLUDE,
 });
+
+
+// Re-launch this same command in the background, with stdout/stderr going to a
+// log file, and hand the terminal back. The room key travels in the child's
+// environment rather than its argv, so it is not visible to `ps`.
+async function detach({ owner, session, root, relay, extraEnv }) {
+  await ensureStateDir();
+  const lf = logFile(owner, session, root);
+  const fd = fs.openSync(lf, 'a');
+  const args = process.argv.slice(2).filter((a) => a !== '--detach' && a !== '-d');
+  const { cmd, args: full } = selfCommand(args);
+
+  const child = spawn(cmd, full, {
+    detached: true,
+    stdio: ['ignore', fd, fd],
+    env: { ...process.env, ...extraEnv, TRACKER_DETACHED: '1' },
+  });
+  child.unref();
+  fs.closeSync(fd);
+
+  await writeSession({ owner, session, root, relay, pid: child.pid, startedAt: Date.now(), log: lf });
+
+  console.log(`\u2713 running in the background (pid ${child.pid})`);
+  console.log(`  logs:  tracker logs ${owner}/${session}`);
+  console.log(`  stop:  tracker stop ${owner}/${session}`);
+}
+
+const isDetachedChild = () => process.env.TRACKER_DETACHED === '1';
+
+// A room id can match more than one local session (share + join of the same room,
+// or the same room synced into two roots), so this returns every match and lets
+// callers decide rather than silently picking one.
+function findSessions(target, { root } = {}) {
+  const all = listSessions();
+  let matches;
+  if (target) {
+    const [owner, session] = String(target).split('/');
+    matches = all.filter((x) => x.owner === owner && x.session === session);
+    if (!matches.length) die(`no such session: ${target}`);
+  } else {
+    matches = all.filter((x) => x.running);
+    if (!matches.length) die('no sessions are running');
+  }
+  if (root) matches = matches.filter((x) => x.root === path.resolve(root));
+  return matches;
+}
 
 // -- commands ---------------------------------------------------------------
 
@@ -107,9 +162,52 @@ function cmdStatus() {
   console.log(`logged in: ${auth?.username ? `yes (${auth.username})` : 'no'}`);
   console.log(`relay:     ${auth?.relay || DEFAULT_RELAY}`);
   console.log(`config:    ${fs.existsSync('pf-sync.config.json') ? 'pf-sync.config.json' : 'none'}`);
-  // Deliberately not claiming live session state: a running daemon is a separate
-  // process and there is no IPC to it yet.
-  console.log('note:      live peer/sync state is printed by the running share/join process');
+
+  const sessions = listSessions();
+  if (!sessions.length) {
+    console.log('sessions:  none (start one with: tracker share <path> --detach)');
+    return;
+  }
+  console.log('sessions:');
+  for (const x of sessions) {
+    const mins = Math.round((Date.now() - x.startedAt) / 60000);
+    const mark = x.running ? '●' : '○';
+    const state = x.running ? `running, pid ${x.pid}, up ${mins}m` : 'not running (stale)';
+    console.log(`  ${mark} ${x.owner}/${x.session}  ${state}`);
+    console.log(`      root ${x.root}`);
+  }
+  console.log('');
+  console.log('Peer and sync detail lives in each session log: tracker logs <owner/session>');
+}
+
+async function cmdStop(flags, positional) {
+  const all = listSessions();
+  if (flags.all) {
+    if (!all.length) return console.log('nothing to stop');
+    for (const x of all) console.log(`${x.owner}/${x.session}: ${await stopSession(x)}`);
+    return;
+  }
+  // Stop every local session matching the room, or orphans get left behind.
+  for (const entry of findSessions(positional[0], { root: flags.root })) {
+    console.log(`${entry.owner}/${entry.session} [${entry.root}]: ${await stopSession(entry)}`);
+  }
+}
+
+function cmdLogs(flags, positional) {
+  const matches = findSessions(positional[0], { root: flags.root });
+  if (matches.length > 1) {
+    console.error('several local sessions match — add --root=<path>:');
+    for (const m of matches) console.error(`  ${m.owner}/${m.session}  root ${m.root}`);
+    process.exit(1);
+  }
+  const entry = matches[0];
+  if (!entry.log || !fs.existsSync(entry.log)) die(`no log file for ${entry.owner}/${entry.session}`);
+  const lines = fs.readFileSync(entry.log, 'utf8').split('\n');
+  const n = Number(flags.n || 40);
+  console.log(lines.slice(-n - 1).join('\n').trimEnd());
+  if (!flags.follow && !flags.f) {
+    console.log(`\n(${entry.log} — use tail -f on that path to follow)`);
+  }
 }
 
 async function cmdShare(flags, positional) {
@@ -122,20 +220,36 @@ async function cmdShare(flags, positional) {
     die(`invalid session name: ${session} (use a-z, 0-9, -, max 39 chars)`);
   }
 
-  const roomKey = generateRoomKey();
+  // A detached child inherits the parent's key through the environment so the
+  // invite stays stable and never appears in argv.
+  const roomKey = process.env.TRACKER_ROOM_KEY
+    ? fromBase64Url(process.env.TRACKER_ROOM_KEY)
+    : generateRoomKey();
   const invite = `${auth.username}/${session}#${toBase64Url(roomKey)}`;
   const relay = relayFor(flags, auth);
   const allow = flags.allow ? String(flags.allow).split(',').filter(Boolean) : null;
 
-  console.log(`✓ session: ${auth.username}/${session}`);
-  console.log('');
-  console.log(`  invite:  tracker join ${invite}`);
-  console.log('');
-  console.log('  The part after # is the encryption key. It never reaches the relay,');
-  console.log('  and anyone holding it can read and write this session — share it');
-  console.log('  over a channel you trust.');
-  if (allow) console.log(`  joins restricted to: ${allow.join(', ')}`);
-  console.log('');
+  if (!isDetachedChild()) {
+    console.log(`✓ session: ${auth.username}/${session}`);
+    console.log('');
+    console.log(`  invite:  tracker join ${invite}`);
+    console.log('');
+    console.log('  The part after # is the encryption key. It never reaches the relay,');
+    console.log('  and anyone holding it can read and write this session — share it');
+    console.log('  over a channel you trust.');
+    if (allow) console.log(`  joins restricted to: ${allow.join(', ')}`);
+    console.log('');
+  }
+
+  if (flags.detach && !isDetachedChild()) {
+    return detach({
+      owner: auth.username,
+      session,
+      root: path.resolve(root),
+      relay,
+      extraEnv: { TRACKER_ROOM_KEY: toBase64Url(roomKey) },
+    });
+  }
 
   await runSync({
     ...syncDefaults(flags, root),
@@ -170,6 +284,10 @@ async function cmdJoin(flags, positional) {
   const root = flags.root || positional[1] || process.cwd();
   if (!fs.existsSync(root)) die(`no such directory: ${root}`);
 
+  if (flags.detach && !isDetachedChild()) {
+    return detach({ owner, session, root: path.resolve(root), relay: relayFor(flags, auth) });
+  }
+
   await runSync({
     ...syncDefaults(flags, root),
     mode: 'e2e',
@@ -203,9 +321,14 @@ function usage() {
       --session=<name>                 default: basename of path
       --allow=<user,...>               restrict joins by username
       --name=<label>                   display name for presence
+      --detach                         run in the background, free the terminal
 
   tracker join <owner/session#key>     attach to an existing session
       --root=<path>                    local directory to sync
+      --detach                         run in the background, free the terminal
+
+  tracker stop [owner/session]         stop a background session (--all for every one)
+  tracker logs [owner/session]         show a background session's log (-n=<lines>)
 
   tracker sync -- [legacy flags]       self-hosted shared-secret relay
 
@@ -226,6 +349,10 @@ async function main() {
       return cmdWhoami();
     case 'status':
       return cmdStatus();
+    case 'stop':
+      return cmdStop(flags, positional);
+    case 'logs':
+      return cmdLogs(flags, positional);
     case 'share':
       return cmdShare(flags, positional);
     case 'join':

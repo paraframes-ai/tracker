@@ -221,7 +221,11 @@ export class EncryptedProvider extends EventEmitter {
     if (type !== FRAME.CONTENT && type !== FRAME.AWARENESS) return;
 
     const { sender, sealed } = decodeSealed(payload);
-    if (sender === this.username) return; // relay shouldn't echo, but don't trust it to
+    // Deliberately NOT skipping frames whose sender matches our own username: one
+    // person syncing a laptop and a desktop is two connections under the same
+    // account, and dropping those meant their edits never reached each other.
+    // Processing a frame we somehow sent ourselves is harmless — Yjs updates are
+    // idempotent — so there is nothing to guard against here.
     if (this.badSenders.has(sender)) return; // already known to be using a different key
 
     let plaintext;
