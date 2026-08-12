@@ -49,6 +49,41 @@ function signingKeyPem() {
 const GITHUB_CLIENT_ID = process.env.TRACKER_GITHUB_CLIENT_ID || 'Ov23liRkXOV0SuKwsR5M';
 
 const SERVER_STARTED_AT = Date.now();
+
+// Per-IP limits on the HTTP endpoints. Only WebSocket *frames* were limited
+// before, which is fine on a private tailnet and not fine once this is reachable
+// from the internet: /v1/auth/device/start is unauthenticated and makes an
+// outbound request to GitHub on every call, so without this it is an easy way to
+// burn the OAuth app's quota.
+const HTTP_LIMITS = { authPerMinute: 10, readPerMinute: 120 };
+const httpHits = new Map(); // key -> { count, resetAt }
+
+function clientIp(req) {
+  // Behind a Cloudflare tunnel the peer address is always local, so prefer the
+  // header Cloudflare sets. Trusted only because nothing else can reach us: the
+  // relay binds 127.0.0.1 and the tunnel is the sole ingress.
+  return (
+    req.headers['cf-connecting-ip'] ||
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+function httpRateLimited(req, bucket, perMinute) {
+  const key = `${bucket}:${clientIp(req)}`;
+  const now = Date.now();
+  const entry = httpHits.get(key);
+  if (!entry || now > entry.resetAt) {
+    httpHits.set(key, { count: 1, resetAt: now + 60_000 });
+    if (httpHits.size > 10_000) {
+      for (const [k, v] of httpHits) if (now > v.resetAt) httpHits.delete(k);
+    }
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > perMinute;
+}
 // Recent refusals, capped — enough to answer "why is this not syncing" without
 // becoming an unbounded log in memory.
 const refusals = [];
@@ -99,6 +134,18 @@ async function githubIdentity(githubToken) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Anything that mints tokens or reaches GitHub is rate limited per IP.
+  const isAuthPath = req.url?.startsWith('/v1/auth/');
+  if (isAuthPath && httpRateLimited(req, 'auth', HTTP_LIMITS.authPerMinute)) {
+    log(`rate limited ${clientIp(req)} on ${req.url}`);
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+    return res.end(JSON.stringify({ error: 'too many requests' }));
+  }
+  if (!isAuthPath && httpRateLimited(req, 'read', HTTP_LIMITS.readPerMinute)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+    return res.end(JSON.stringify({ error: 'too many requests' }));
+  }
+
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('tracker relay ok\n');
