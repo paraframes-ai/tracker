@@ -108,26 +108,25 @@ within a moment, and vice-versa — including simultaneous edits to the same fil
 
 ## Deploying the relay on a GCE e2-small
 
-This gets you a always-on relay at `wss://relay.example.com` with automatic TLS.
-Ready-made config files live in [`deploy/`](deploy/).
+Using **Tailscale + MagicDNS** — no public exposure, no domain, no manual certs.
+The relay lives on your private tailnet and both Macs reach it by its MagicDNS
+name. Ready-made config lives in [`deploy/`](deploy/).
 
-**Architecture:** the relay listens on `127.0.0.1:1234` (localhost only) and
-[Caddy](https://caddyserver.com) sits in front on ports 80/443, terminating TLS
-and proxying WebSocket traffic to it. The relay port is never exposed publicly.
+**Architecture:** the relay listens on `127.0.0.1:1234`. `tailscale serve`
+publishes it over HTTPS on the VM's MagicDNS name (e.g.
+`pf-relay.<your-tailnet>.ts.net`), provisioning the TLS cert automatically.
+Nothing is exposed to the public internet — only devices on your tailnet can
+reach it, and Tailscale needs **no inbound firewall ports** at all.
 
-### 1. Create the VM and open web ports
+### 1. Create the VM (no public ports needed)
 
 ```bash
 gcloud compute instances create pf-relay \
   --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud
-
-# allow HTTP/HTTPS (needed for TLS certs + wss://); relay port 1234 stays private
-gcloud compute firewall-rules create allow-web \
-  --allow=tcp:80,tcp:443 --target-tags=http-server,https-server
-gcloud compute instances add-tags pf-relay --tags=http-server,https-server
 ```
 
-Point a DNS **A record** (e.g. `relay.example.com`) at the VM's external IP.
+No `gcloud firewall-rules` — Tailscale connects outbound, so you never open a
+public port.
 
 ### 2. Install Node, clone, install deps
 
@@ -141,19 +140,35 @@ cd /opt/paraframes-live
 sudo npm install --omit=dev
 ```
 
-### 3. Create the run user and secret
+### 3. Install Tailscale and join your tailnet
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up            # opens a login URL — authenticate to your tailnet
+tailscale status             # note this machine's MagicDNS name
+```
+
+In the [Tailscale admin console](https://login.tailscale.com/admin/dns), make
+sure **MagicDNS** is enabled and turn on **HTTPS Certificates** (both under the
+DNS tab). `tailscale serve` needs the HTTPS toggle to mint the cert.
+
+Install Tailscale on **both Macs** too and `tailscale up` into the same tailnet —
+that's how they reach the relay by name.
+
+### 4. Create the run user (+ optional shared secret)
 
 ```bash
 sudo useradd --system --no-create-home pfrelay
 sudo chown -R pfrelay:pfrelay /opt/paraframes-live
 
-# the shared secret your daemons will pass as --token
+# Optional: the tailnet is already private, but a token adds defense-in-depth.
+# Leave the file empty to run without one.
 echo "PF_RELAY_TOKEN=$(openssl rand -hex 16)" | sudo tee /etc/paraframes-live.env
 sudo chmod 600 /etc/paraframes-live.env
-sudo cat /etc/paraframes-live.env   # note the token — both of you need it
+sudo cat /etc/paraframes-live.env   # note the token if you set one
 ```
 
-### 4. Start the relay as a service
+### 5. Start the relay as a service
 
 ```bash
 sudo cp deploy/pf-relay.service /etc/systemd/system/pf-relay.service
@@ -162,41 +177,41 @@ sudo systemctl enable --now pf-relay
 sudo systemctl status pf-relay      # should be active (running)
 ```
 
-It now auto-starts on boot and restarts if it crashes.
+Auto-starts on boot and restarts if it crashes. It listens only on
+`127.0.0.1:1234` (per the unit file).
 
-### 5. Put Caddy in front for automatic HTTPS
+### 6. Publish it over HTTPS on the MagicDNS name
 
 ```bash
-sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-sudo apt-get update && sudo apt-get install -y caddy
-
-# edit the domain in the Caddyfile first, then:
-sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
-sudo sed -i 's/relay.example.com/YOUR-DOMAIN/' /etc/caddy/Caddyfile
-sudo systemctl reload caddy
+sudo tailscale serve --bg 1234      # proxies https://<magicdns-name>/ -> :1234
+tailscale serve status              # shows the public-within-tailnet URL
 ```
 
-Caddy fetches a Let's Encrypt cert automatically on first request.
-
-### 6. Verify
+### 7. Verify and connect
 
 ```bash
-curl https://relay.example.com          # -> paraframes-live relay ok
+# from the VM or either Mac (must be on the tailnet):
+curl https://pf-relay.<your-tailnet>.ts.net     # -> paraframes-live relay ok
 ```
 
-Then on each Mac, connect with the token from step 3:
+Then on each Mac (both on the tailnet, Xcode project checked out):
 
 ```bash
-npm run sync -- --relay=wss://relay.example.com --room=paraframes \
-  --token=THE-TOKEN --root=/path/to/ParaFrames --name=you
+npm run sync -- \
+  --relay=wss://pf-relay.<your-tailnet>.ts.net \
+  --room=paraframes \
+  --token=THE-TOKEN \          # omit if you left the env file empty
+  --root=/path/to/ParaFrames \
+  --name=you
 ```
 
 **Updating the relay later:**
 `cd /opt/paraframes-live && sudo git pull && sudo npm install --omit=dev && sudo systemctl restart pf-relay`
+
+> Simpler alternative: since all tailnet traffic is already WireGuard-encrypted,
+> you can skip step 6 entirely and connect with plain
+> `--relay=ws://pf-relay.<your-tailnet>.ts.net:1234` — but then set `HOST=0.0.0.0`
+> in the systemd unit so the relay listens on the tailnet interface.
 
 ## Safety notes / current limitations (MVP)
 
