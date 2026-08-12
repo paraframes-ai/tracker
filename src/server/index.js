@@ -19,6 +19,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import { WebSocketServer } from 'ws';
 
 import {
@@ -80,7 +81,11 @@ const SERVER_STARTED_AT = Date.now();
 // from the internet: /v1/auth/device/start is unauthenticated and makes an
 // outbound request to GitHub on every call, so without this it is an easy way to
 // burn the OAuth app's quota.
-const HTTP_LIMITS = { authPerMinute: 10, readPerMinute: 120 };
+// Downloads get their own, tighter bucket: the binaries are ~60-95 MB each, so
+// the read limit that is fine for JSON would allow a lot of egress.
+const HTTP_LIMITS = { authPerMinute: 10, readPerMinute: 120, downloadPerMinute: 20 };
+// Directory of release binaries to serve at /dl/, if any.
+const DIST_DIR = process.env.TRACKER_DIST_DIR || null;
 const httpHits = new Map(); // key -> { count, resetAt }
 
 function clientIp(req) {
@@ -166,7 +171,12 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
     return res.end(JSON.stringify({ error: 'too many requests' }));
   }
-  if (!isAuthPath && httpRateLimited(req, 'read', HTTP_LIMITS.readPerMinute)) {
+  const isDownload = req.url?.startsWith('/dl');
+  if (isDownload && httpRateLimited(req, 'dl', HTTP_LIMITS.downloadPerMinute)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+    return res.end(JSON.stringify({ error: 'too many requests' }));
+  }
+  if (!isAuthPath && !isDownload && httpRateLimited(req, 'read', HTTP_LIMITS.readPerMinute)) {
     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
     return res.end(JSON.stringify({ error: 'too many requests' }));
   }
@@ -254,6 +264,43 @@ const server = http.createServer(async (req, res) => {
       'Referrer-Policy': 'no-referrer',
     });
     return res.end(html);
+  }
+
+
+  // Release binaries. Only bare filenames are accepted — no subdirectories and
+  // no separators of any kind — so path traversal is impossible by construction
+  // rather than by sanitising a path afterwards.
+  if (req.method === 'GET' && isDownload && DIST_DIR) {
+    const rest = req.url.slice(3).replace(/^\//, '').split('?')[0];
+    if (rest === '') {
+      let names = [];
+      try {
+        names = fs.readdirSync(DIST_DIR).filter((n) => /^[A-Za-z0-9._-]+$/.test(n)).sort();
+      } catch {
+        return sendJson(res, 500, { error: 'dist dir unreadable' });
+      }
+      const body = names.map((n) => `<li><a href="/dl/${n}">${n}</a></li>`).join('');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(`<!doctype html><meta charset=utf-8><title>tracker downloads</title><ul>${body}</ul>`);
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(rest)) return sendJson(res, 400, { error: 'bad filename' });
+    const full = path.join(DIST_DIR, rest);
+    let stat;
+    try {
+      stat = fs.statSync(full);
+      if (!stat.isFile()) throw new Error('not a file');
+    } catch {
+      return sendJson(res, 404, { error: 'not found' });
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': stat.size,
+      'Content-Disposition': `attachment; filename="${rest}"`,
+      'Cache-Control': 'no-cache',
+    });
+    // Streamed, not buffered: these are ~60-95 MB and this box runs several
+    // services on modest memory.
+    return fs.createReadStream(full).pipe(res);
   }
 
   if (req.method === 'GET' && req.url === '/viewer.bundle.js') {
@@ -555,6 +602,7 @@ function broadcastControl(room, except, msg) {
 
 server.listen(PORT, HOST, () => {
   log(`listening on http://${HOST}:${PORT}`);
+  if (DIST_DIR) log(`serving downloads from ${DIST_DIR} at /dl/`);
   log(`identity providers: ${AUTH}${forgejoAuthEnabled ? ` (forgejo api ${FORGEJO_API})` : ''}`);
   log(`token auth: Ed25519 JWT${ephemeralKey ? ' (ephemeral key — tokens die with this process)' : ''}`);
   if (DEV_AUTH) log('DEV AUTH ENABLED — /v1/auth/dev mints tokens for any username');
