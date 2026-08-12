@@ -366,13 +366,7 @@ export async function runSync(config) {
   process.on('SIGTERM', shutdown);
 }
 
-// Direct invocation keeps the original flag interface working:
-//   node src/daemon.js --relay=... --room=... --token=... --root=...
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const { loadConfig } = await import('./config.js');
-  const config = loadConfig();
-  runSync({ ...config, mode: 'legacy' }).catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
-}
+// No auto-run on import. A `import.meta.url === process.argv[1]` guard here is
+// not safe once this is bundled into a single executable: the two can coincide,
+// so merely importing runSync would start a legacy daemon on every command. The
+// legacy entry point lives in src/pf-sync.js instead.
