@@ -17,6 +17,7 @@
 //   TRACKER_DEV_AUTH=1        enable /v1/auth/dev — never set in production
 //   TRACKER_TOKEN_TTL_DAYS    default 30
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -75,6 +76,39 @@ async function forgejoIdentity(accessToken) {
 }
 
 const SERVER_STARTED_AT = Date.now();
+
+// Cloudflare's Browser Cache TTL rewrites our Cache-Control on static assets
+// (4 hours by default), so a browser will happily serve a stale bundle after a
+// deploy no matter what the origin asked for. Referencing each bundle by a
+// content hash makes the URL itself change when the content does, which no
+// intermediate cache can get wrong.
+const bundleVersions = new Map();
+function bundleVersion(name) {
+  if (bundleVersions.has(name)) return bundleVersions.get(name);
+  let v = 'dev';
+  try {
+    const buf = fs.readFileSync(new URL(`./${name}`, import.meta.url));
+    v = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 12);
+  } catch {
+    /* asset missing; its own route reports that */
+  }
+  bundleVersions.set(name, v);
+  return v;
+}
+
+// HTML must never be cached, or the browser keeps an old page that references an
+// old bundle hash and the versioning is pointless.
+const htmlHeaders = (extra = {}) => ({
+  'Content-Type': 'text/html; charset=utf-8',
+  'Cache-Control': 'no-store, must-revalidate',
+  'Referrer-Policy': 'no-referrer',
+  ...extra,
+});
+
+const withBundleVersions = (html) =>
+  html
+    .replace(/__GIT_BUNDLE_V__/g, bundleVersion('git.bundle.js'))
+    .replace(/__VIEWER_BUNDLE_V__/g, bundleVersion('viewer.bundle.js'));
 
 // Per-IP limits on the HTTP endpoints. Only WebSocket *frames* were limited
 // before, which is fine on a private tailnet and not fine once this is reachable
@@ -261,13 +295,14 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return sendJson(res, 500, { error: 'dashboard asset missing' });
     }
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      // The dashboard is same-origin and self-contained; no external anything.
-      'Content-Security-Policy':
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
-      'Referrer-Policy': 'no-referrer',
-    });
+    res.writeHead(
+      200,
+      htmlHeaders({
+        // The dashboard is same-origin and self-contained; no external anything.
+        'Content-Security-Policy':
+          "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      }),
+    );
     return res.end(html);
   }
 
@@ -319,27 +354,31 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return sendJson(res, 500, { error: 'git ui asset missing' });
     }
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy':
-        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
-      'Referrer-Policy': 'no-referrer',
-    });
-    return res.end(html);
+    res.writeHead(
+      200,
+      htmlHeaders({
+        'Content-Security-Policy':
+          "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
+      }),
+    );
+    return res.end(withBundleVersions(html));
   }
 
-  if (req.method === 'GET' && req.url === '/git.bundle.js') {
+  if (req.method === 'GET' && req.url.startsWith('/git.bundle.js')) {
     let js;
     try {
       js = fs.readFileSync(new URL('./git.bundle.js', import.meta.url));
     } catch {
       return sendJson(res, 500, { error: 'git bundle missing — run npm run build:git' });
     }
-    res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' });
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    });
     return res.end(js);
   }
 
-  if (req.method === 'GET' && req.url === '/viewer.bundle.js') {
+  if (req.method === 'GET' && req.url.startsWith('/viewer.bundle.js')) {
     let js;
     try {
       js = fs.readFileSync(new URL('./viewer.bundle.js', import.meta.url));
@@ -348,7 +387,7 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'public, max-age=31536000, immutable',
     });
     return res.end(js);
   }
@@ -362,13 +401,14 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return sendJson(res, 500, { error: 'viewer asset missing' });
     }
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy':
-        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
-      'Referrer-Policy': 'no-referrer',
-    });
-    return res.end(html);
+    res.writeHead(
+      200,
+      htmlHeaders({
+        'Content-Security-Policy':
+          "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
+      }),
+    );
+    return res.end(withBundleVersions(html));
   }
 
   // GitHub's device endpoints send no CORS headers, so a browser cannot call
