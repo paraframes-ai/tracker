@@ -31,14 +31,16 @@ the "we're both in the file at the same time" moment in between commits.
       ▼                                                      ▼
  ┌──────────┐   fs watch          relay (WebSocket)    ┌──────────┐
  │  daemon  │◀────────────▶ CRDT ◀────────────────────▶│  daemon  │
- │ (Yjs+fs) │  write-back       (Yjs updates)          │ (Yjs+fs) │
+ │ (Yjs+fs) │  write-back    (encrypted updates)       │ (Yjs+fs) │
  └──────────┘                                           └──────────┘
 ```
 
 Each side runs a **daemon** that watches the project folder, mirrors file
 changes into a shared CRDT document, and writes merged changes from the other
-side back to disk. A small **relay** in the middle just forwards CRDT updates
-(it stores nothing and never sees your files as files).
+side back to disk. A **relay** in the middle forwards CRDT updates between
+peers. It stores nothing, and with the default transport it cannot read what it
+forwards — updates are encrypted end-to-end with a key that only the
+participants hold.
 
 ## What syncs (and what doesn't)
 
@@ -48,187 +50,109 @@ side back to disk. A small **relay** in the middle just forwards CRDT updates
   to git on purpose. Char-level merging would corrupt structured/binary files.
   When you add a file/target in Xcode, commit the `.pbxproj` through git as usual.
 
+Line endings are normalized: the shared document holds LF, and each machine keeps
+whatever convention its own files use. Mixed macOS/Windows sessions work without
+either side configuring an editor.
+
 ## Setup
 
-Requires Node.js ≥ 18.
-
 ```bash
-npm install
+tracker login
+tracker share ~/Projects/ParaFrames
 ```
 
-### 1. Run the relay (once, somewhere both of you can reach)
+`share` prints an invite:
 
-The relay is what connects the two of you. **The daemons never talk to each
-other directly** — they both dial *out* to the relay (which firewalls/NAT
-allow), and the relay forwards edits between them. So it needs to live at a
-fixed, public address both Macs can reach. A **GCE e2-small** (2 vCPU / 2 GB)
-is plenty — the relay only shuttles tiny text deltas.
+```
+✓ session: ashwin/paraframes
 
-For a quick local smoke test:
-
-```bash
-PF_RELAY_TOKEN=some-shared-secret npm run relay
-# listens on ws://0.0.0.0:1234  (fine for localhost; use TLS for real internet)
+  invite:  tracker join ashwin/paraframes#kR7fJ2mQ8vN3xP1wL5tY9bC4dF6hJ0aS2eG7uI8oK3M
 ```
 
-For real internet use, deploy it properly with auto-restart and TLS — see
-**[Deploying the relay on a GCE e2-small](#deploying-the-relay-on-a-gce-e2-small)**
-below.
-
-### 2. Each developer runs a daemon
-
-Get on the **same git commit with a clean tree first** (`git pull`), then:
+Your coworker runs that line with their own checkout:
 
 ```bash
-cp pf-sync.config.example.json pf-sync.config.json
-# edit relay/room/token (must match your coworker) and your local root/name
-npm run sync
-```
-
-Or without a config file, via flags/env:
-
-```bash
-npm run sync -- \
-  --relay=wss://your-host \
-  --room=paraframes \
-  --token=some-shared-secret \
-  --root=/Users/you/dev/ParaFrames \
-  --name=alex
+tracker join ashwin/paraframes#kR7fJ2mQ... --root ~/dev/ParaFrames
 ```
 
 Now edit in Xcode as normal. Saved changes appear in your coworker's checkout
 within a moment, and vice-versa — including simultaneous edits to the same file.
 
+**The part after `#` is the encryption key.** It never reaches the relay, and
+anyone holding it can read and write the session — treat the whole invite as a
+secret and send it over a channel you trust. `--allow=<user,...>` on `share`
+additionally restricts joins to named accounts.
+
+### Commands
+
+```
+tracker login [--dev=<username>]     authenticate (GitHub device flow)
+tracker logout                       forget the stored token
+tracker whoami                       print the authenticated username
+tracker status                       show auth and config state
+
+tracker share [path]                 start a session, print an invite
+    --session=<name>                 default: basename of path
+    --allow=<user,...>               restrict joins by username
+    --name=<label>                   display name for presence
+
+tracker join <owner/session#key>     attach to an existing session
+    --root=<path>                    local directory to sync
+
+tracker sync -- [legacy flags]       self-hosted shared-secret relay
+```
+
+## From source
+
+Requires Node.js ≥ 20 (WebCrypto is used for encryption).
+
+```bash
+npm install
+node src/cli.js login
+```
+
 ## Configuration
 
-`relay`, `room`, and `token` **must match** between the two of you. `root` and
-`name` are per-machine. Precedence: CLI flags → env (`PF_RELAY`, `PF_ROOM`,
-`PF_ROOT`, `PF_NAME`, `PF_TOKEN`) → `pf-sync.config.json` → defaults. `include`
-/ `exclude` globs can be overridden in the config file.
+`include` / `exclude` globs can be overridden in `pf-sync.config.json` — copy
+`pf-sync.config.example.json` to start. `--root` and `--name` are per-machine.
 
-## Deploying the relay on a GCE e2-small
+For the legacy self-hosted transport, `relay`, `room`, and `token` **must match**
+between participants. Precedence: CLI flags → env (`PF_RELAY`, `PF_ROOM`,
+`PF_ROOT`, `PF_NAME`, `PF_TOKEN`) → `pf-sync.config.json` → defaults.
 
-Using **Tailscale + MagicDNS** — no public exposure, no domain, no manual certs.
-The relay lives on your private tailnet and both Macs reach it by its MagicDNS
-name. Ready-made config lives in [`deploy/`](deploy/).
+## Self-hosting
 
-**Architecture:** the relay listens on `127.0.0.1:1234`. `tailscale serve`
-publishes it over HTTPS on the VM's MagicDNS name (e.g.
-`pf-relay.<your-tailnet>.ts.net`), provisioning the TLS cert automatically.
-Nothing is exposed to the public internet — only devices on your tailnet can
-reach it, and Tailscale needs **no inbound firewall ports** at all.
+You don't need to run a server to use this. If you'd rather not route even
+ciphertext through someone else's machine, see
+**[docs/self-hosting.md](docs/self-hosting.md)** — it covers both the
+authenticated end-to-end relay and the original shared-secret relay (including
+the Tailscale + MagicDNS recipe for a GCE e2-small).
 
-### 1. Create the VM (no public ports needed)
+The design is written up in
+**[RFC 001](docs/rfc-001-hosted-relay.md)** — protocol, auth flow, invite
+format, threat model, and quotas.
 
-```bash
-gcloud compute instances create pf-relay \
-  --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud
-```
-
-No `gcloud firewall-rules` — Tailscale connects outbound, so you never open a
-public port.
-
-### 2. Install Node, clone, install deps
-
-```bash
-sudo apt-get update
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-sudo git clone https://github.com/paraframes-ai/tracker /opt/paraframes-live
-cd /opt/paraframes-live
-sudo npm install --omit=dev
-```
-
-### 3. Install Tailscale and join your tailnet
-
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up            # opens a login URL — authenticate to your tailnet
-tailscale status             # note this machine's MagicDNS name
-```
-
-In the [Tailscale admin console](https://login.tailscale.com/admin/dns), make
-sure **MagicDNS** is enabled and turn on **HTTPS Certificates** (both under the
-DNS tab). `tailscale serve` needs the HTTPS toggle to mint the cert.
-
-Install Tailscale on **both Macs** too and `tailscale up` into the same tailnet —
-that's how they reach the relay by name.
-
-### 4. Create the run user (+ optional shared secret)
-
-```bash
-sudo useradd --system --no-create-home pfrelay
-sudo chown -R pfrelay:pfrelay /opt/paraframes-live
-
-# Optional: the tailnet is already private, but a token adds defense-in-depth.
-# Leave the file empty to run without one.
-echo "PF_RELAY_TOKEN=$(openssl rand -hex 16)" | sudo tee /etc/paraframes-live.env
-sudo chmod 600 /etc/paraframes-live.env
-sudo cat /etc/paraframes-live.env   # note the token if you set one
-```
-
-### 5. Start the relay as a service
-
-```bash
-sudo cp deploy/pf-relay.service /etc/systemd/system/pf-relay.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now pf-relay
-sudo systemctl status pf-relay      # should be active (running)
-```
-
-Auto-starts on boot and restarts if it crashes. It listens only on
-`127.0.0.1:1234` (per the unit file).
-
-### 6. Publish it over HTTPS on the MagicDNS name
-
-```bash
-sudo tailscale serve --bg 1234      # proxies https://<magicdns-name>/ -> :1234
-tailscale serve status              # shows the public-within-tailnet URL
-```
-
-### 7. Verify and connect
-
-```bash
-# from the VM or either Mac (must be on the tailnet):
-curl https://pf-relay.<your-tailnet>.ts.net     # -> paraframes-live relay ok
-```
-
-Then on each Mac (both on the tailnet, Xcode project checked out):
-
-```bash
-npm run sync -- \
-  --relay=wss://pf-relay.<your-tailnet>.ts.net \
-  --room=paraframes \
-  --token=THE-TOKEN \          # omit if you left the env file empty
-  --root=/path/to/ParaFrames \
-  --name=you
-```
-
-**Updating the relay later:**
-`cd /opt/paraframes-live && sudo git pull && sudo npm install --omit=dev && sudo systemctl restart pf-relay`
-
-> Simpler alternative: since all tailnet traffic is already WireGuard-encrypted,
-> you can skip step 6 entirely and connect with plain
-> `--relay=ws://pf-relay.<your-tailnet>.ts.net:1234` — but then set `HOST=0.0.0.0`
-> in the systemd unit so the relay listens on the tailnet interface.
-
-## Safety notes / current limitations (MVP)
+## Safety notes / current limitations
 
 - **Baseline rule:** start from the same clean git commit. If your local copy of
   a file differs from the shared copy when you connect, the shared copy wins and
   your local version is saved to `.pf-sync-trash/` (nothing is silently lost).
 - **Deletes** from your coworker move your local file to `.pf-sync-trash/` rather
   than hard-deleting.
-- The relay keeps the session in memory only. If **both** daemons disconnect,
-  the shared doc is gone and the next one to connect re-seeds it from its disk —
+- The relay keeps the session in memory only. If **all** daemons disconnect, the
+  shared doc is gone and the next one to connect re-seeds it from its disk —
   which is why git remains your durable source of truth. (Persistent rooms are on
-  the roadmap.)
-- Best on trusted networks or behind TLS + token. Treat the token as a secret.
+  the roadmap, and remain compatible with end-to-end encryption: the relay would
+  retain ciphertext it still cannot read.)
+- **Metadata is not encrypted.** The relay operator can see usernames, session
+  names, peer counts, message sizes, and timing — just not file contents or
+  names.
+- **No forward secrecy** yet: whoever holds a room key can read that session's
+  traffic. Rotating means issuing a new invite.
 
 ## Roadmap
 
 - Presence in Xcode (collaborator cursors) via a Source Editor extension.
-- Persistent relay rooms (LevelDB) so sessions survive full disconnects.
-- End-to-end encryption of CRDT updates so the relay never sees plaintext.
+- Persistent relay rooms so sessions survive full disconnects.
+- Forward secrecy via per-session key agreement between peers.
 - A menu-bar app wrapper so non-terminal users can start/stop a session.
