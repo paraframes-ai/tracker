@@ -58,16 +58,22 @@ npm install
 
 ### 1. Run the relay (once, somewhere both of you can reach)
 
-For real internet use, run this on a small server behind TLS and set a shared
-secret:
+The relay is what connects the two of you. **The daemons never talk to each
+other directly** — they both dial *out* to the relay (which firewalls/NAT
+allow), and the relay forwards edits between them. So it needs to live at a
+fixed, public address both Macs can reach. A **GCE e2-small** (2 vCPU / 2 GB)
+is plenty — the relay only shuttles tiny text deltas.
+
+For a quick local smoke test:
 
 ```bash
 PF_RELAY_TOKEN=some-shared-secret npm run relay
-# listens on ws://0.0.0.0:1234  (put a TLS proxy in front for wss://)
+# listens on ws://0.0.0.0:1234  (fine for localhost; use TLS for real internet)
 ```
 
-Cheap options: a $5 VPS, Fly.io, Render, or your own machine exposed via a
-tunnel (Tailscale / cloudflared / ngrok).
+For real internet use, deploy it properly with auto-restart and TLS — see
+**[Deploying the relay on a GCE e2-small](#deploying-the-relay-on-a-gce-e2-small)**
+below.
 
 ### 2. Each developer runs a daemon
 
@@ -99,6 +105,98 @@ within a moment, and vice-versa — including simultaneous edits to the same fil
 `name` are per-machine. Precedence: CLI flags → env (`PF_RELAY`, `PF_ROOM`,
 `PF_ROOT`, `PF_NAME`, `PF_TOKEN`) → `pf-sync.config.json` → defaults. `include`
 / `exclude` globs can be overridden in the config file.
+
+## Deploying the relay on a GCE e2-small
+
+This gets you a always-on relay at `wss://relay.example.com` with automatic TLS.
+Ready-made config files live in [`deploy/`](deploy/).
+
+**Architecture:** the relay listens on `127.0.0.1:1234` (localhost only) and
+[Caddy](https://caddyserver.com) sits in front on ports 80/443, terminating TLS
+and proxying WebSocket traffic to it. The relay port is never exposed publicly.
+
+### 1. Create the VM and open web ports
+
+```bash
+gcloud compute instances create pf-relay \
+  --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud
+
+# allow HTTP/HTTPS (needed for TLS certs + wss://); relay port 1234 stays private
+gcloud compute firewall-rules create allow-web \
+  --allow=tcp:80,tcp:443 --target-tags=http-server,https-server
+gcloud compute instances add-tags pf-relay --tags=http-server,https-server
+```
+
+Point a DNS **A record** (e.g. `relay.example.com`) at the VM's external IP.
+
+### 2. Install Node, clone, install deps
+
+```bash
+sudo apt-get update
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+sudo git clone https://github.com/paraframes-ai/tracker /opt/paraframes-live
+cd /opt/paraframes-live
+sudo npm install --omit=dev
+```
+
+### 3. Create the run user and secret
+
+```bash
+sudo useradd --system --no-create-home pfrelay
+sudo chown -R pfrelay:pfrelay /opt/paraframes-live
+
+# the shared secret your daemons will pass as --token
+echo "PF_RELAY_TOKEN=$(openssl rand -hex 16)" | sudo tee /etc/paraframes-live.env
+sudo chmod 600 /etc/paraframes-live.env
+sudo cat /etc/paraframes-live.env   # note the token — both of you need it
+```
+
+### 4. Start the relay as a service
+
+```bash
+sudo cp deploy/pf-relay.service /etc/systemd/system/pf-relay.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pf-relay
+sudo systemctl status pf-relay      # should be active (running)
+```
+
+It now auto-starts on boot and restarts if it crashes.
+
+### 5. Put Caddy in front for automatic HTTPS
+
+```bash
+sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update && sudo apt-get install -y caddy
+
+# edit the domain in the Caddyfile first, then:
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+sudo sed -i 's/relay.example.com/YOUR-DOMAIN/' /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+Caddy fetches a Let's Encrypt cert automatically on first request.
+
+### 6. Verify
+
+```bash
+curl https://relay.example.com          # -> paraframes-live relay ok
+```
+
+Then on each Mac, connect with the token from step 3:
+
+```bash
+npm run sync -- --relay=wss://relay.example.com --room=paraframes \
+  --token=THE-TOKEN --root=/path/to/ParaFrames --name=you
+```
+
+**Updating the relay later:**
+`cd /opt/paraframes-live && sudo git pull && sudo npm install --omit=dev && sudo systemctl restart pf-relay`
 
 ## Safety notes / current limitations (MVP)
 

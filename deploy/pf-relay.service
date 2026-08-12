@@ -1,0 +1,41 @@
+# systemd unit for the ParaFrames Live relay.
+#
+# Install:
+#   sudo cp deploy/pf-relay.service /etc/systemd/system/pf-relay.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pf-relay
+#
+# Assumes:
+#   - repo cloned to /opt/paraframes-live  (change WorkingDirectory if not)
+#   - a dedicated unprivileged user `pfrelay`
+#   - node at /usr/bin/node  (check with `which node`)
+#   - secrets in /etc/paraframes-live.env  (see below)
+
+[Unit]
+Description=ParaFrames Live relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pfrelay
+Group=pfrelay
+WorkingDirectory=/opt/paraframes-live
+ExecStart=/usr/bin/node src/relay.cjs
+EnvironmentFile=/etc/paraframes-live.env
+
+# Bind to localhost only; Caddy terminates TLS and proxies to us.
+Environment=HOST=127.0.0.1
+Environment=PORT=1234
+
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

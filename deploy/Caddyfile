@@ -1,0 +1,15 @@
+# Caddy reverse proxy → automatic HTTPS (Let's Encrypt) → wss:// for the relay.
+#
+# Replace relay.example.com with your real domain (a DNS A record must point it
+# at the VM's public IP). Caddy obtains and renews the TLS cert automatically
+# and transparently forwards WebSocket upgrades — no extra config needed.
+#
+# Install:
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile   # edit the domain first
+#   sudo systemctl reload caddy
+#
+# Then your daemons connect with:  --relay=wss://relay.example.com
+
+relay.example.com {
+	reverse_proxy 127.0.0.1:1234
+}
