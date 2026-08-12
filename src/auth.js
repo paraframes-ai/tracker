@@ -119,6 +119,28 @@ export async function login({ relay, onPrompt }) {
   return out;
 }
 
+// Exchange a Forgejo access token for a service token. Used when the relay is
+// configured with TRACKER_AUTH=forgejo, i.e. self-hosted identity with no
+// GitHub account involved.
+export async function forgejoLogin({ relay, forgejoToken }) {
+  const httpBase = relay.replace(/^ws/, 'http').replace(/\/+$/, '');
+  const out = await postJson(`${httpBase}/v1/auth/forgejo`, { forgejoToken });
+  await saveAuth({ token: out.token, username: out.username, relay });
+  return out;
+}
+
+// Read a secret from stdin so it need not appear in argv — where it would be
+// visible to `ps` and recorded in shell history.
+export function readSecretFromStdin() {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (d) => (buf += d));
+    process.stdin.on('end', () => resolve(buf.trim()));
+    process.stdin.on('error', reject);
+  });
+}
+
 // Dev-only counterpart to the relay's /v1/auth/dev. Exists so the transport and
 // crypto layers can be exercised without registering an OAuth app; the relay
 // refuses this endpoint unless TRACKER_DEV_AUTH=1.

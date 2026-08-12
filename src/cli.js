@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { clearAuth, devLogin, loadAuth, login } from './auth.js';
+import { clearAuth, devLogin, forgejoLogin, loadAuth, login, readSecretFromStdin } from './auth.js';
 import { fromBase64Url, generateRoomKey, toBase64Url } from './crypto.js';
 import { runSync } from './daemon.js';
 import { DEFAULT_EXCLUDE, DEFAULT_INCLUDE } from './config.js';
@@ -58,6 +58,20 @@ const syncDefaults = (flags, root) => ({
 
 async function cmdLogin(flags) {
   const relay = relayFor(flags, null);
+
+  // Self-hosted identity: exchange a Forgejo access token. Prefer piping it in
+  // so it stays out of argv (visible to `ps`) and out of shell history:
+  //   printf '%s' "$TOKEN" | tracker login --forgejo-token
+  if (flags['forgejo-token']) {
+    const supplied = flags['forgejo-token'];
+    const forgejoToken =
+      supplied === true ? await readSecretFromStdin() : String(supplied).trim();
+    if (!forgejoToken) die('no token supplied on stdin');
+    const out = await forgejoLogin({ relay, forgejoToken });
+    console.log(`\u2713 logged in as ${out.username} (forgejo, relay ${relay})`);
+    return;
+  }
+
   if (flags.dev) {
     // Dev path: the relay mints a token directly. Only works against a relay
     // started with TRACKER_DEV_AUTH=1.
@@ -177,7 +191,10 @@ async function cmdSync() {
 function usage() {
   console.log(`tracker — real-time collaborative file sync
 
-  tracker login [--dev=<username>]     authenticate (GitHub device flow)
+  tracker login                        authenticate (GitHub device flow)
+      --forgejo-token[=<t>]            authenticate with a Forgejo access token
+                                       (omit the value to read it from stdin)
+      --dev=<username>                 dev-only, needs TRACKER_DEV_AUTH=1
   tracker logout                       forget the stored token
   tracker whoami                       print the authenticated username
   tracker status                       show auth and config state

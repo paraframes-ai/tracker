@@ -85,14 +85,62 @@ const ago = (t, now) => {
   return Math.floor(s / 3600) + 'h';
 };
 
+let cfg = { github: true, forgejo: false, forgejoUrl: null };
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/v1/config');
+    if (r.ok) cfg = await r.json();
+  } catch { /* fall back to the defaults above */ }
+}
+
 function renderLogin(msg) {
   clearInterval(timer);
+  const err = msg ? `<div class="warn" style="margin-top:.8rem">${esc(msg)}</div>` : '';
+
+  if (cfg.forgejo) {
+    const base = cfg.forgejoUrl || '';
+    const link = base
+      ? `<a href="${esc(base)}/user/settings/applications" target="_blank" rel="noreferrer">${esc(base)}/user/settings/applications</a>`
+      : 'your Forgejo instance under Settings \u2192 Applications';
+    app.innerHTML = `<div class="card">
+      <b>Sign in with a Forgejo access token</b>
+      <div class="muted" style="font-size:.85rem;margin:.35rem 0 .8rem">
+        Create a token at ${link}, then paste it here. It is exchanged once for a
+        session token and never stored by the relay.</div>
+      <div class="row">
+        <input id="fjt" type="password" placeholder="Forgejo access token" autocomplete="off"
+          style="flex:1;min-width:240px;padding:.5rem .6rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-family:var(--mono)">
+        <button id="fjgo">Sign in</button>
+      </div>${err}</div>`;
+    document.getElementById('fjgo').onclick = forgejoSignIn;
+    document.getElementById('fjt').onkeydown = (e) => { if (e.key === 'Enter') forgejoSignIn(); };
+    return;
+  }
+
   app.innerHTML = `<div class="card">
     <div class="row"><div><b>Sign in with GitHub</b><div class="muted" style="font-size:.85rem">
     Needed to see your own sessions. Uses the same device flow as the CLI.</div></div>
     <button id="go">Sign in</button></div>
-    ${msg ? `<div class="warn" style="margin-top:.8rem">${esc(msg)}</div>` : ''}</div>`;
+    ${err}</div>`;
   document.getElementById('go').onclick = startDeviceFlow;
+}
+
+async function forgejoSignIn() {
+  const el = document.getElementById('fjt');
+  const forgejoToken = el.value.trim();
+  if (!forgejoToken) return renderLogin('Paste a token first.');
+  app.innerHTML = '<div class="card muted">Verifying token\u2026</div>';
+  try {
+    const r = await fetch('/v1/auth/forgejo', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forgejoToken }),
+    });
+    const j = await r.json();
+    if (!r.ok) return renderLogin(j.error || 'token rejected');
+    token = j.token; localStorage.setItem(KEY, token);
+    load();
+  } catch (e) { renderLogin(e.message); }
 }
 
 async function startDeviceFlow() {
@@ -189,7 +237,7 @@ async function load() {
   timer = setInterval(load, 3000);
 }
 
-load();
+loadConfig().then(load);
 </script>
 </body>
 </html>

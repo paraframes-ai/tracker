@@ -48,6 +48,31 @@ function signingKeyPem() {
 // Same public client id the CLI compiles in (device flow has no secret).
 const GITHUB_CLIENT_ID = process.env.TRACKER_GITHUB_CLIENT_ID || 'Ov23liRkXOV0SuKwsR5M';
 
+// Which identity providers may mint tokens: 'github', 'forgejo', or 'both'.
+//
+// 'both' is deliberately not the default. Usernames are the session namespace,
+// and two providers can each have a user called `ashwin` — so with both enabled,
+// whichever provider is easier to sign up with becomes an impersonation route
+// into the other's namespace. Pick one unless you have a reason not to.
+const AUTH = (process.env.TRACKER_AUTH || 'github').toLowerCase();
+const githubAuthEnabled = AUTH === 'github' || AUTH === 'both';
+const forgejoAuthEnabled = AUTH === 'forgejo' || AUTH === 'both';
+// Called server-side, so it can talk to Forgejo directly rather than back out
+// through the public hostname.
+const FORGEJO_API = (process.env.TRACKER_FORGEJO_API || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+
+// Resolve a Forgejo access token to an identity. The token is used once and
+// never stored, exactly as with the GitHub path.
+async function forgejoIdentity(accessToken) {
+  const res = await fetch(`${FORGEJO_API}/api/v1/user`, {
+    headers: { Authorization: `token ${accessToken}`, Accept: 'application/json' },
+  });
+  if (!res.ok) throw new Error(`forgejo rejected the token (${res.status})`);
+  const user = await res.json();
+  if (!user?.login || !user?.id) throw new Error('forgejo returned no login');
+  return { sub: `fj:${user.id}`, username: String(user.login).toLowerCase() };
+}
+
 const SERVER_STARTED_AT = Date.now();
 
 // Per-IP limits on the HTTP endpoints. Only WebSocket *frames* were limited
@@ -152,7 +177,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Lets the dashboard render the right login UI instead of guessing.
+  if (req.method === 'GET' && req.url === '/v1/config') {
+    return sendJson(res, 200, {
+      auth: AUTH,
+      github: githubAuthEnabled,
+      forgejo: forgejoAuthEnabled,
+      forgejoUrl: process.env.TRACKER_FORGEJO_URL || null,
+    });
+  }
+
+  // Exchange a Forgejo access token for a service token.
+  if (req.method === 'POST' && req.url === '/v1/auth/forgejo') {
+    if (!forgejoAuthEnabled) return sendJson(res, 404, { error: 'forgejo auth not enabled' });
+    try {
+      const { forgejoToken } = await readJson(req);
+      if (!forgejoToken) return sendJson(res, 400, { error: 'forgejoToken required' });
+      const ident = await forgejoIdentity(forgejoToken);
+      const token = sign({ ...ident, privateKey: keys.privateKey, ttlSeconds: TTL_DAYS * 86400 });
+      log(`issued token for ${ident.username} (forgejo)`);
+      return sendJson(res, 200, { token, username: ident.username, expiresInDays: TTL_DAYS });
+    } catch (err) {
+      return sendJson(res, 401, { error: err.message });
+    }
+  }
+
   if (req.method === 'POST' && req.url === '/v1/auth/exchange') {
+    if (!githubAuthEnabled) return sendJson(res, 404, { error: 'github auth not enabled' });
     try {
       const { githubToken } = await readJson(req);
       if (!githubToken) return sendJson(res, 400, { error: 'githubToken required' });
@@ -241,6 +292,7 @@ const server = http.createServer(async (req, res) => {
   // them directly. The relay proxies the two steps. No client secret is
   // involved — device flow does not use one.
   if (req.method === 'POST' && req.url === '/v1/auth/device/start') {
+    if (!githubAuthEnabled) return sendJson(res, 404, { error: 'github auth not enabled' });
     try {
       const r = await fetch('https://github.com/login/device/code', {
         method: 'POST',
@@ -261,6 +313,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/v1/auth/device/poll') {
+    if (!githubAuthEnabled) return sendJson(res, 404, { error: 'github auth not enabled' });
     try {
       const { device_code } = await readJson(req);
       if (!device_code) return sendJson(res, 400, { error: 'device_code required' });
@@ -502,6 +555,7 @@ function broadcastControl(room, except, msg) {
 
 server.listen(PORT, HOST, () => {
   log(`listening on http://${HOST}:${PORT}`);
+  log(`identity providers: ${AUTH}${forgejoAuthEnabled ? ` (forgejo api ${FORGEJO_API})` : ''}`);
   log(`token auth: Ed25519 JWT${ephemeralKey ? ' (ephemeral key — tokens die with this process)' : ''}`);
   if (DEV_AUTH) log('DEV AUTH ENABLED — /v1/auth/dev mints tokens for any username');
 });
