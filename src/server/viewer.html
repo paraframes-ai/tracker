@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParaFrames Live — viewer</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg:#fbfbfc; --panel:#fff; --border:#e3e5e9; --fg:#16181d; --muted:#6b7280;
+    --live:#14804a; --idle:#9ca3af; --warn:#b42318; --accent:#2f5bd7;
+    --sel:#eef2ff; --ln:#b6bcc7;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0f1115; --panel:#16181d; --border:#262a32; --fg:#e6e8ec; --muted:#9aa1ad;
+      --live:#3fbf7f; --idle:#6b7280; --warn:#ff7b72; --accent:#7aa2f7;
+      --sel:#1d2433; --ln:#4b5563;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding:1rem 1.25rem; border-bottom:1px solid var(--border); background:var(--panel);
+    display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:1rem; margin:0; font-family:var(--mono); font-weight:600; }
+  .pill { font-size:.75rem; padding:.1rem .55rem; border-radius:999px; border:1px solid var(--border); }
+  .pill.live { color:var(--live); border-color:color-mix(in srgb, var(--live) 40%, transparent); }
+  .pill.idle { color:var(--idle); }
+  .muted { color:var(--muted); font-size:.85rem; }
+  .spacer { flex:1; }
+  a { color:var(--accent); }
+  main { display:grid; grid-template-columns:minmax(200px,300px) 1fr; min-height:calc(100vh - 60px); }
+  @media (max-width:720px) { main { grid-template-columns:1fr; } #side { max-height:38vh; } }
+  #side { border-right:1px solid var(--border); overflow:auto; background:var(--panel); }
+  #side .hd { padding:.6rem 1rem; font-size:.78rem; color:var(--muted); border-bottom:1px solid var(--border);
+    position:sticky; top:0; background:var(--panel); }
+  ul { list-style:none; margin:0; padding:.35rem; }
+  li { padding:.3rem .6rem; border-radius:6px; cursor:pointer; font-family:var(--mono); font-size:.8rem;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li:hover { background:color-mix(in srgb, var(--fg) 6%, transparent); }
+  li.sel { background:var(--sel); }
+  #file { overflow:auto; }
+  .fname { padding:.6rem 1rem; border-bottom:1px solid var(--border); font-family:var(--mono);
+    font-size:.82rem; position:sticky; top:0; background:var(--bg); }
+  pre { margin:0; padding:.8rem 1rem 3rem; overflow-x:auto; }
+  code { font-family:var(--mono); font-size:.8rem; line-height:1.6; }
+  .ln { display:inline-block; width:3.2em; color:var(--ln); user-select:none; text-align:right;
+    padding-right:1em; }
+  .empty { padding:2rem 1rem; color:var(--muted); }
+  .card { margin:1.25rem; padding:1rem 1.25rem; border:1px solid var(--border);
+    border-radius:10px; background:var(--panel); }
+  .warn { color:var(--warn); }
+  code.inline { background:color-mix(in srgb, var(--fg) 8%, transparent); padding:.1rem .3rem; border-radius:4px; }
+  footer { padding:.6rem 1.25rem; border-top:1px solid var(--border); color:var(--muted);
+    font-size:.78rem; background:var(--panel); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">…</h1>
+  <span class="pill idle" id="status">connecting</span>
+  <span class="muted" id="peers"></span>
+  <span class="spacer"></span>
+  <span class="muted" id="count"></span>
+  <a href="/dashboard" class="muted">dashboard</a>
+</header>
+<div id="app"></div>
+<main>
+  <div id="side"><div class="hd">files</div><ul id="tree"></ul></div>
+  <div id="file"><div class="empty">Connecting…</div></div>
+</main>
+<footer>
+  Read-only. Decrypted in your browser — the room key lives in this URL's fragment and is never
+  sent to the relay, which stores and forwards ciphertext only.
+</footer>
+<script src="/viewer.bundle.js"></script>
+</body>
+</html>

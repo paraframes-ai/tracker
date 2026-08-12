@@ -318,7 +318,11 @@ export async function runSync(config) {
       `session=${config.owner}/${config.session} relay=${config.relay} ` +
         `as=${config.username} name=${config.name}`,
     );
+    // node's global WebSocket cannot set request headers, so the daemon supplies
+    // the `ws` package explicitly (the browser viewer uses the global instead).
+    const WSImpl = (await import('ws')).default;
     provider = new EncryptedProvider({
+      WebSocketImpl: WSImpl,
       relay: config.relay,
       owner: config.owner,
       session: config.session,

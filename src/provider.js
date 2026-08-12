@@ -12,7 +12,6 @@
 // us seed a room whose shared copy we had not yet seen.
 
 import * as Y from 'yjs';
-import WS from 'ws';
 import * as syncProtocol from 'y-protocols/sync';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import * as encoding from 'lib0/encoding';
@@ -40,8 +39,27 @@ const RECONNECT_MAX_MS = 15_000;
 const CONNECTION_STABLE_MS = 5_000;
 
 export class EncryptedProvider extends EventEmitter {
-  constructor({ relay, owner, session, username, token, roomKey, doc, awareness, allow }) {
+  constructor({
+    relay,
+    owner,
+    session,
+    username,
+    token,
+    roomKey,
+    doc,
+    awareness,
+    allow,
+    // Injected so the same provider runs under node (the `ws` package, which can
+    // set an Authorization header) and in a browser (native WebSocket, which
+    // cannot — it passes the token as a subprotocol instead). Defaulting to the
+    // global rather than importing `ws` here keeps this file bundleable for the
+    // browser, where importing `ws` would fail.
+    WebSocketImpl = globalThis.WebSocket,
+    readOnly = false,
+  }) {
     super();
+    this.WS = WebSocketImpl;
+    this.readOnly = readOnly;
     this.relay = relay.replace(/\/+$/, '');
     this.owner = owner;
     this.session = session;
@@ -78,6 +96,7 @@ export class EncryptedProvider extends EventEmitter {
 
     this._onDocUpdate = (update, origin) => {
       if (origin === this) return; // came from a peer; don't echo it back
+      if (this.readOnly) return; // a viewer observes; it never contributes edits
       const enc = encoding.createEncoder();
       syncProtocol.writeUpdate(enc, update);
       this._sendSealed(FRAME.CONTENT, encoding.toUint8Array(enc));
@@ -115,57 +134,78 @@ export class EncryptedProvider extends EventEmitter {
   _open() {
     if (this.destroyed) return;
     // Bearer token goes in a header, not the query string, so it stays out of
-    // the relay's access logs.
-    const ws = new WS(this._url(), { headers: { Authorization: `Bearer ${this.token}` } });
-    ws.binaryType = 'nodebuffer';
+    // the relay's access logs. Browsers cannot set headers on a WebSocket, so
+    // there the token rides in the subprotocol instead — same reasoning, since a
+    // subprotocol is also not logged as part of the URL.
+    const Impl = this.WS;
+    const browserLike = typeof Impl.prototype?.addEventListener === 'function' && !Impl.Server;
+    const ws = browserLike
+      ? new Impl(this._url(), [`bearer.${this.token}`])
+      : new Impl(this._url(), { headers: { Authorization: `Bearer ${this.token}` } });
+    ws.binaryType = browserLike ? 'arraybuffer' : 'nodebuffer';
     this.ws = ws;
 
     const openedAt = Date.now();
-    ws.on('open', () => {
+
+    const onOpen = () => {
       this.emit('status', { status: 'connected' });
       this.pingTimer = setInterval(() => {
-        if (ws.readyState === WS.OPEN) ws.send(encodeFrame(FRAME.PING));
+        if (ws.readyState === 1) ws.send(encodeFrame(FRAME.PING));
       }, PING_INTERVAL_MS);
-    });
+    };
 
-    ws.on('message', (data) => {
+    const onMessage = (data) => {
       this._onMessage(data).catch((err) => this.emit('error', err));
-    });
+    };
 
-    ws.on('close', (code, reasonBuf) => {
-      clearInterval(this.pingTimer);
-      const reason = reasonBuf?.toString() || '';
-      this.emit('status', { status: 'disconnected', code, reason });
-      // 4001/4003/4004 are terminal: bad token, not allowed, no such room.
-      // Retrying those just spins, so surface them and stop.
-      if (code === 4001 || code === 4003 || code === 4004) {
-        this.emit('fatal', { code, reason });
-        return;
-      }
-      // An oversized frame is not transient: reconnecting resends exactly the
-      // same data and gets refused identically. Say something actionable instead
-      // of looping forever looking connected.
-      if (reason === 'maxFrameBytes') {
-        this.emit('fatal', {
-          code,
-          reason:
-            'this project is too large for the relay to sync in one message ' +
-            '(initial sync exceeded the relay frame limit)',
-        });
-        return;
-      }
-      if (this.destroyed) return;
-      // Only treat the connection as healthy — and reset backoff — if it actually
-      // stayed up. Resetting on 'open' meant a connection that died immediately
-      // reconnected at full speed forever instead of backing off.
-      if (Date.now() - openedAt > CONNECTION_STABLE_MS) {
-        this.reconnectDelay = RECONNECT_BASE_MS;
-      }
-      setTimeout(() => this._open(), this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
-    });
+    const onClose = (code, reason) => this._afterClose(code, reason, openedAt);
 
-    ws.on('error', (err) => this.emit('status', { status: 'error', reason: err.message }));
+    if (browserLike) {
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('message', (ev) => onMessage(new Uint8Array(ev.data)));
+      ws.addEventListener('close', (ev) => onClose(ev.code, ev.reason || ''));
+      ws.addEventListener('error', () =>
+        this.emit('status', { status: 'error', reason: 'websocket error' }),
+      );
+    } else {
+      ws.on('open', onOpen);
+      ws.on('message', onMessage);
+      ws.on('close', (code, reasonBuf) => onClose(code, reasonBuf?.toString() || ''));
+      ws.on('error', (err) => this.emit('status', { status: 'error', reason: err.message }));
+    }
+
+  }
+
+  _afterClose(code, reason, openedAt) {
+    clearInterval(this.pingTimer);
+    this.emit('status', { status: 'disconnected', code, reason });
+    // 4001/4003/4004 are terminal: bad token, not allowed, no such room.
+    // Retrying those just spins, so surface them and stop.
+    if (code === 4001 || code === 4003 || code === 4004) {
+      this.emit('fatal', { code, reason });
+      return;
+    }
+    // An oversized frame is not transient: reconnecting resends exactly the
+    // same data and gets refused identically. Say something actionable instead
+    // of looping forever looking connected.
+    if (reason === 'maxFrameBytes') {
+      this.emit('fatal', {
+        code,
+        reason:
+          'this project is too large for the relay to sync in one message ' +
+          '(initial sync exceeded the relay frame limit)',
+      });
+      return;
+    }
+    if (this.destroyed) return;
+    // Only treat the connection as healthy — and reset backoff — if it actually
+    // stayed up. Resetting on 'open' meant a connection that died immediately
+    // reconnected at full speed forever instead of backing off.
+    if (Date.now() - openedAt > CONNECTION_STABLE_MS) {
+      this.reconnectDelay = RECONNECT_BASE_MS;
+    }
+    setTimeout(() => this._open(), this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 
   async _onMessage(data) {
@@ -296,10 +336,10 @@ export class EncryptedProvider extends EventEmitter {
   }
 
   _sendSealed(type, plaintext) {
-    if (!this.key || this.ws?.readyState !== WS.OPEN) return;
+    if (!this.key || this.ws?.readyState !== 1) return;
     seal(this.key, type, this.ctxFor(this.username), plaintext)
       .then((sealed) => {
-        if (this.ws?.readyState === WS.OPEN) {
+        if (this.ws?.readyState === 1) {
           this.ws.send(encodeSealed(type, this.username, sealed));
         }
       })

@@ -205,6 +205,38 @@ const server = http.createServer(async (req, res) => {
     return res.end(html);
   }
 
+  if (req.method === 'GET' && req.url === '/viewer.bundle.js') {
+    let js;
+    try {
+      js = fs.readFileSync(new URL('./viewer.bundle.js', import.meta.url));
+    } catch {
+      return sendJson(res, 500, { error: 'viewer bundle missing — run npm run build:viewer' });
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    });
+    return res.end(js);
+  }
+
+  // /s/<owner>/<session> — the viewer shell. The room key travels in the URL
+  // fragment, which browsers never send, so the relay cannot see it even here.
+  if (req.method === 'GET' && /^\/s\/[^/]+\/[^/?#]+/.test(req.url || '')) {
+    let html;
+    try {
+      html = fs.readFileSync(new URL('./viewer.html', import.meta.url), 'utf8');
+    } catch {
+      return sendJson(res, 500, { error: 'viewer asset missing' });
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy':
+        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
+      'Referrer-Policy': 'no-referrer',
+    });
+    return res.end(html);
+  }
+
   // GitHub's device endpoints send no CORS headers, so a browser cannot call
   // them directly. The relay proxies the two steps. No client secret is
   // involved — device flow does not use one.
@@ -282,7 +314,28 @@ const server = http.createServer(async (req, res) => {
   res.end('not found\n');
 });
 
-const wss = new WebSocketServer({ noServer: true });
+// Browsers cannot set request headers on a WebSocket, so the browser client
+// passes its token as a subprotocol (`bearer.<token>`), which they *can* set.
+// Deliberately not a query parameter: that would put the token in access logs.
+// The chosen protocol must be echoed back or the browser aborts the handshake.
+const wss = new WebSocketServer({
+  noServer: true,
+  handleProtocols: (protocols) => {
+    for (const p of protocols) if (p.startsWith('bearer.')) return p;
+    return false;
+  },
+});
+
+function bearerFrom(req) {
+  const header = req.headers['authorization'] || '';
+  if (header.startsWith('Bearer ')) return header.slice(7);
+  const proto = req.headers['sec-websocket-protocol'] || '';
+  for (const p of proto.split(',')) {
+    const t = p.trim();
+    if (t.startsWith('bearer.')) return t.slice(7);
+  }
+  return null;
+}
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
 
@@ -304,8 +357,7 @@ server.on('upgrade', (req, socket, head) => {
   const target = parseRoomPath(req.url || '');
   if (!target) return reject(400, 'Bad Request');
 
-  const auth = req.headers['authorization'] || '';
-  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const bearer = bearerFrom(req);
   if (!bearer) return reject(401, 'Unauthorized');
 
   let claims;
