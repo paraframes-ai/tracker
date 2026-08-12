@@ -310,7 +310,9 @@ const server = http.createServer(async (req, res) => {
 
   // Our own git UI, over Forgejo's REST API. Same origin as Forgejo, so the API
   // is reachable directly with no CORS and no proxy.
-  if (req.method === 'GET' && (req.url === '/app' || req.url.startsWith('/app?') || req.url.startsWith('/app#'))) {
+  // /app and /app/callback both serve the same shell; the OAuth redirect lands on
+  // the callback path and the script finishes the exchange there.
+  if (req.method === 'GET' && /^\/app(\/callback)?(\?|#|$)/.test(req.url || '')) {
     let html;
     try {
       html = fs.readFileSync(new URL('./git.html', import.meta.url), 'utf8');

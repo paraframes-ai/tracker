@@ -1,6 +1,9 @@
 // src/browser/git.js
 var API = "/api/v1";
 var TOKEN_KEY = "tracker.forgejo.token";
+var OAUTH_KEY = "tracker.oauth";
+var CLIENT_ID = "4f944f7b-2cdb-4b42-bfb9-eb6000b6f475";
+var REDIRECT_URI = `${location.origin}/app/callback`;
 var $ = (s) => document.querySelector(s);
 var esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 var bytes = (n) => n == null ? "" : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
@@ -15,10 +18,78 @@ var ago = (iso) => {
   return `${Math.floor(s / 86400)}d ago`;
 };
 var token = localStorage.getItem(TOKEN_KEY) || "";
-var authMode = "unknown";
+var authMode = "none";
+var oauth = null;
+function loadOAuth() {
+  try {
+    const o = JSON.parse(localStorage.getItem(OAUTH_KEY) || "null");
+    if (o && o.access_token && o.expires_at > Date.now() + 30000)
+      return o;
+  } catch {}
+  return null;
+}
+var b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+async function pkcePair() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64url(digest) };
+}
+async function beginOAuth() {
+  const { verifier, challenge } = await pkcePair();
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.setItem("pf.pkce", verifier);
+  sessionStorage.setItem("pf.state", state);
+  sessionStorage.setItem("pf.return", location.hash || "#/");
+  const u = new URL("/login/oauth/authorize", location.origin);
+  u.searchParams.set("client_id", CLIENT_ID);
+  u.searchParams.set("redirect_uri", REDIRECT_URI);
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("state", state);
+  u.searchParams.set("code_challenge_method", "S256");
+  u.searchParams.set("code_challenge", challenge);
+  location.assign(u.toString());
+}
+async function completeOAuth() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get("code");
+  const state = q.get("state");
+  if (!code)
+    throw new Error(q.get("error_description") || q.get("error") || "no authorization code");
+  if (!state || state !== sessionStorage.getItem("pf.state"))
+    throw new Error("state mismatch — sign in again");
+  const verifier = sessionStorage.getItem("pf.pkce");
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    code,
+    code_verifier: verifier || ""
+  });
+  const res = await fetch("/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body
+  });
+  const j = await res.json();
+  if (!res.ok || !j.access_token)
+    throw new Error(j.error_description || j.error || "token exchange failed");
+  localStorage.setItem(OAUTH_KEY, JSON.stringify({
+    access_token: j.access_token,
+    refresh_token: j.refresh_token || null,
+    expires_at: Date.now() + (j.expires_in ? j.expires_in * 1000 : 3600000)
+  }));
+  sessionStorage.removeItem("pf.pkce");
+  sessionStorage.removeItem("pf.state");
+  const back = sessionStorage.getItem("pf.return") || "#/";
+  location.replace(`/app${back}`);
+}
 async function api(path) {
-  const headers = authMode === "token" && token ? { Authorization: `token ${token}` } : {};
-  const res = await fetch(`${API}${path}`, { headers, credentials: "same-origin" });
+  const headers = {};
+  if (authMode === "oauth" && oauth)
+    headers.Authorization = `Bearer ${oauth.access_token}`;
+  else if (authMode === "token" && token)
+    headers.Authorization = `token ${token}`;
+  const res = await fetch(`${API}${path}`, { headers });
   if (res.status === 401 || res.status === 403) {
     const err = new Error("unauthorized");
     err.auth = true;
@@ -47,27 +118,28 @@ function renderLogin(msg) {
   $("#main").innerHTML = `
     <div class="card narrow">
       <h2>Sign in</h2>
-      <p class="muted">Easiest: sign in to Forgejo in this browser and this page picks up
-        your session — nothing to copy.</p>
-      <p><a class="btn" href="/user/login?redirect_to=${encodeURIComponent("/app")}">Sign in to Forgejo</a></p>
+      <p class="muted">Sign in with your ParaFrames Git account. Nothing to copy or paste.</p>
+      <p><button id="oauth" class="primary">Sign in with ParaFrames Git</button></p>
       <hr>
-      <p class="muted small">Or paste an access token (<a href="/user/settings/applications"
+      <p class="muted small">Or use an access token (<a href="/user/settings/applications"
         target="_blank" rel="noreferrer">Settings → Applications</a>, scopes
         <code>read:user</code> and <code>read:repository</code>):</p>
       <div class="row">
         <input id="tok" type="text" inputmode="text" spellcheck="false" autocapitalize="off"
           autocorrect="off" autocomplete="off" name="pf-token-${Date.now()}"
           placeholder="paste token here">
-        <button id="tokgo" class="primary">Use token</button>
+        <button id="tokgo">Use token</button>
       </div>
       ${msg ? `<p class="warn">${esc(msg)}</p>` : ""}
     </div>`;
+  $("#oauth").onclick = () => beginOAuth().catch((e) => renderLogin(e.message));
   const submit = () => {
     const v = $("#tok").value.trim();
     if (!v)
       return renderLogin("Paste a token first.");
     token = v;
     authMode = "token";
+    localStorage.removeItem(OAUTH_KEY);
     localStorage.setItem(TOKEN_KEY, v);
     render();
   };
@@ -169,19 +241,10 @@ async function viewCommits({ owner, repo, ref }) {
         <a class="sha" href="/${full}/commit/${c.sha}" target="_blank" rel="noreferrer">${c.sha.slice(0, 8)}</a>
       </div>`).join("")}</div></div>`;
 }
-async function probeCookieAuth() {
-  try {
-    const res = await fetch(`${API}/user`, { credentials: "same-origin" });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 async function render() {
-  if (authMode === "unknown") {
-    authMode = await probeCookieAuth() ? "cookie" : "token";
-  }
-  if (authMode === "token" && !token)
+  oauth = loadOAuth();
+  authMode = oauth ? "oauth" : token ? "token" : "none";
+  if (authMode === "none")
     return renderLogin();
   const r = route();
   try {
@@ -201,20 +264,28 @@ async function render() {
   }
 }
 async function whoami() {
-  if (authMode === "unknown")
+  if (authMode === "none")
     return;
   try {
     const u = await api("/user");
-    $("#who").innerHTML = `<span class="muted small">${esc(u.login)}${authMode === "cookie" ? " · via Forgejo session" : ""}</span>` + (authMode === "token" ? '<button id="out" class="link">sign out</button>' : "");
-    if (authMode !== "token")
-      return;
+    $("#who").innerHTML = `<span class="muted small">${esc(u.login)}</span><button id="out" class="link">sign out</button>`;
     $("#out").onclick = () => {
       localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(OAUTH_KEY);
       token = "";
+      oauth = null;
+      authMode = "none";
       $("#who").innerHTML = "";
       render();
     };
   } catch {}
 }
 window.addEventListener("hashchange", render);
-render().then(whoami);
+if (location.pathname.replace(/\/+$/, "") === "/app/callback") {
+  completeOAuth().catch((err) => {
+    document.querySelector("#main").innerHTML = `<div class="card narrow warn">Sign-in failed: ${esc(err.message)}
+        <p><a href="/app">Try again</a></p></div>`;
+  });
+} else {
+  render().then(whoami);
+}
