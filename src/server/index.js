@@ -17,6 +17,7 @@
 //   TRACKER_DEV_AUTH=1        enable /v1/auth/dev — never set in production
 //   TRACKER_TOKEN_TTL_DAYS    default 30
 
+import fs from 'node:fs';
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 
@@ -36,7 +37,16 @@ const HOST = process.env.HOST || '0.0.0.0';
 const DEV_AUTH = process.env.TRACKER_DEV_AUTH === '1';
 const TTL_DAYS = Number(process.env.TRACKER_TOKEN_TTL_DAYS || 30);
 
-const keys = loadOrCreateKeyPair(process.env.TRACKER_JWT_PRIVATE_KEY);
+// A PEM is multi-line, which makes it awkward to carry in a systemd
+// EnvironmentFile — so accept a path as well as the key material itself.
+function signingKeyPem() {
+  const file = process.env.TRACKER_JWT_PRIVATE_KEY_FILE;
+  if (file) return fs.readFileSync(file, 'utf8');
+  return process.env.TRACKER_JWT_PRIVATE_KEY;
+}
+
+const keys = loadOrCreateKeyPair(signingKeyPem());
+const ephemeralKey = !process.env.TRACKER_JWT_PRIVATE_KEY_FILE && !process.env.TRACKER_JWT_PRIVATE_KEY;
 const rooms = new Rooms();
 
 const log = (msg) => console.log(`[relay] ${msg}`);
@@ -269,7 +279,7 @@ function broadcastControl(room, except, msg) {
 
 server.listen(PORT, HOST, () => {
   log(`listening on http://${HOST}:${PORT}`);
-  log(`token auth: Ed25519 JWT${process.env.TRACKER_JWT_PRIVATE_KEY ? '' : ' (ephemeral key — tokens die with this process)'}`);
+  log(`token auth: Ed25519 JWT${ephemeralKey ? ' (ephemeral key — tokens die with this process)' : ''}`);
   if (DEV_AUTH) log('DEV AUTH ENABLED — /v1/auth/dev mints tokens for any username');
 });
 

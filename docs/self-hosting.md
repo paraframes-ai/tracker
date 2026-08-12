@@ -154,7 +154,8 @@ PORT=8787 TRACKER_JWT_PRIVATE_KEY="$(cat jwt.pem)" npm run server
 | Env | Meaning |
 | --- | --- |
 | `PORT` / `HOST` | Listen address (default `0.0.0.0:8787`) |
-| `TRACKER_JWT_PRIVATE_KEY` | Ed25519 private key PEM for signing service tokens |
+| `TRACKER_JWT_PRIVATE_KEY_FILE` | Path to an Ed25519 private key PEM (preferred) |
+| `TRACKER_JWT_PRIVATE_KEY` | The PEM itself, if you would rather not use a file |
 | `TRACKER_TOKEN_TTL_DAYS` | Token lifetime, default 30 |
 | `TRACKER_DEV_AUTH=1` | Enables `/v1/auth/dev`. **Never set in production** |
 
@@ -164,9 +165,13 @@ Generate a signing key:
 openssl genpkey -algorithm ed25519 -out jwt.pem
 ```
 
-If `TRACKER_JWT_PRIVATE_KEY` is unset the server generates an ephemeral key, so
-every restart invalidates all issued tokens. That is fine for local testing and
-wrong for anything else.
+If neither key variable is set the server generates an ephemeral one, so every
+restart silently invalidates every token already issued. That is fine for local
+testing and wrong for anything else.
+
+For a systemd deployment, use `deploy/pf-auth-relay.service` — it runs alongside
+the legacy `pf-relay.service` so shared-secret sessions keep working while
+clients migrate.
 
 Put it behind a TLS terminator (Caddy, nginx, a cloud load balancer) so clients
 can use `wss://`. Content is already end-to-end encrypted, but TLS still protects

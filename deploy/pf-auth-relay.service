@@ -1,0 +1,55 @@
+# systemd unit for the authenticated, end-to-end encrypted relay
+# (src/server/index.js — see docs/rfc-001-hosted-relay.md).
+#
+# This is the successor to pf-relay.service. Both can run side by side: the
+# legacy relay on :1234 and this one on :8787, so existing shared-secret
+# sessions keep working while clients migrate.
+#
+# Install:
+#   sudo cp deploy/pf-auth-relay.service /etc/systemd/system/
+#   sudo openssl genpkey -algorithm ed25519 -out /etc/tracker-jwt.pem
+#   sudo chown pfrelay:pfrelay /etc/tracker-jwt.pem
+#   sudo chmod 600 /etc/tracker-jwt.pem
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pf-auth-relay
+#
+# Assumes:
+#   - repo cloned to /opt/paraframes-live  (change WorkingDirectory if not)
+#   - a dedicated unprivileged user `pfrelay`
+#   - node at /usr/bin/node
+#
+# The signing key must persist: without it the server generates an ephemeral
+# key on every start, which silently invalidates every token already issued.
+
+[Unit]
+Description=ParaFrames Live authenticated relay (E2E)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pfrelay
+Group=pfrelay
+WorkingDirectory=/opt/paraframes-live
+ExecStart=/usr/bin/node src/server/index.js
+
+# Bind to localhost only; `tailscale serve` publishes it over HTTPS.
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=TRACKER_JWT_PRIVATE_KEY_FILE=/etc/tracker-jwt.pem
+
+# TRACKER_DEV_AUTH is deliberately NOT set. It would expose /v1/auth/dev, which
+# mints a token for any username with no verification whatsoever — fine for a
+# local test, a full authentication bypass anywhere else.
+
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
