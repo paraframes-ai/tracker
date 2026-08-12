@@ -249,7 +249,12 @@ const server = http.createServer(async (req, res) => {
 
   // --- dashboard -----------------------------------------------------------
 
-  if (req.method === 'GET' && (req.url === '/dashboard' || req.url === '/dashboard/')) {
+  // /live is the same page: it is the path the Forgejo navbar links to, so the
+  // two services read as one site on one hostname.
+  if (
+    req.method === 'GET' &&
+    ['/dashboard', '/dashboard/', '/live', '/live/'].includes(req.url)
+  ) {
     let html;
     try {
       html = fs.readFileSync(new URL('./dashboard.html', import.meta.url), 'utf8');
