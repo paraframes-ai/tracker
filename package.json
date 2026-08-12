@@ -16,7 +16,8 @@
     "server": "node src/server/index.js",
     "sync": "node src/pf-sync.js",
     "test": "node --test test/",
-    "build:viewer": "bun build --target=browser src/browser/viewer.js --outfile src/server/viewer.bundle.js"
+    "build:viewer": "bun build --target=browser src/browser/viewer.js --outfile src/server/viewer.bundle.js",
+    "build:git": "bun build --target=browser src/browser/git.js --outfile src/server/git.bundle.js"
   },
   "dependencies": {
     "chokidar": "^3.6.0",

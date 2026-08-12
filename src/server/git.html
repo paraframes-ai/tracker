@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParaFrames — code</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg:#fafafb; --panel:#fff; --border:#e4e4e9; --fg:#17171c; --muted:#6b6b78;
+    --brand:#5b5bd6; --brand-hover:#4f4fc4; --warn:#b42318; --ok:#16a34a;
+    --ln:#b9b9c4; --hover:#f4f4f8;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0e0e12; --panel:#16161c; --border:#26262f; --fg:#e8e8ee; --muted:#9a9aa8;
+      --brand:#7c7cf0; --brand-hover:#8f8ff5; --warn:#ff7b72; --ok:#3fbf7f;
+      --ln:#4a4a58; --hover:#1d1d25;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system,
+    BlinkMacSystemFont,"Inter","Segoe UI",Roboto,sans-serif; letter-spacing:-.006em; }
+  a { color:var(--brand); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+    border-bottom:1px solid var(--border); padding:.7rem 1.1rem;
+    display:flex; align-items:center; gap:1rem; flex-wrap:wrap; }
+  .logo { display:flex; align-items:center; gap:.5rem; font-weight:650; letter-spacing:-.02em; }
+  .mark { width:20px; height:20px; border-radius:5px; background:linear-gradient(135deg,var(--brand),#a855f7); }
+  nav { display:flex; gap:.15rem; }
+  nav a { padding:.3rem .65rem; border-radius:7px; color:var(--fg); font-weight:500; font-size:.9rem; }
+  nav a:hover { background:var(--hover); text-decoration:none; }
+  nav a.on { color:var(--brand); background:color-mix(in srgb, var(--brand) 12%, transparent); }
+  .spacer { flex:1; }
+  .dotlive { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--ok); margin-inline-end:5px; }
+
+  #crumb { padding:.7rem 1.1rem; font-family:var(--mono); font-size:.85rem;
+    border-bottom:1px solid var(--border); background:var(--bg); }
+  #crumb .sep { color:var(--muted); margin:0 .4rem; }
+  #crumb .here { color:var(--muted); }
+
+  main { max-width:1080px; margin:0 auto; padding:1.1rem; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    overflow:hidden; }
+  .card.narrow { max-width:520px; margin:2rem auto; padding:1.25rem; }
+  .card h2 { margin:0 0 .4rem; font-size:1.05rem; }
+  .pad { padding:1rem; }
+  .muted { color:var(--muted); }
+  .small { font-size:.82rem; }
+  .warn { color:var(--warn); }
+  .row { display:flex; gap:.6rem; align-items:center; }
+  input, select { font:inherit; padding:.45rem .55rem; border-radius:8px; border:1px solid var(--border);
+    background:var(--bg); color:var(--fg); }
+  input { flex:1; font-family:var(--mono); }
+  button { font:inherit; padding:.45rem .85rem; border-radius:8px; border:1px solid var(--border);
+    background:var(--panel); color:var(--fg); cursor:pointer; font-weight:500; }
+  button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
+  button.primary:hover { background:var(--brand-hover); }
+  button.link { border:0; background:none; color:var(--muted); padding:0 .2rem; cursor:pointer; }
+  code { font-family:var(--mono); font-size:.85em; }
+  .snippet { font-family:var(--mono); font-size:.82rem; background:var(--bg); padding:.7rem .8rem;
+    border-radius:8px; border:1px solid var(--border); overflow-x:auto; }
+
+  .bar { display:flex; gap:.5rem; align-items:center; margin-bottom:.8rem; flex-wrap:wrap; }
+  .btn { padding:.4rem .7rem; border:1px solid var(--border); border-radius:8px; background:var(--panel);
+    color:var(--fg); font-size:.85rem; font-weight:500; }
+  .btn:hover { background:var(--hover); text-decoration:none; }
+  .clone { font-size:.78rem; color:var(--muted); background:var(--panel); border:1px solid var(--border);
+    padding:.35rem .55rem; border-radius:8px; }
+
+  .list .item { display:flex; justify-content:space-between; gap:1rem; padding:.85rem 1rem;
+    border:1px solid var(--border); border-radius:var(--radius); background:var(--panel);
+    margin-bottom:.5rem; color:var(--fg); }
+  .list .item:hover { background:var(--hover); text-decoration:none; border-color:var(--brand); }
+  .name { font-weight:600; font-family:var(--mono); font-size:.92rem; }
+  .tag { font-size:.7rem; border:1px solid var(--border); border-radius:999px; padding:.05rem .45rem;
+    color:var(--muted); margin-inline-start:.4rem; }
+  .item-meta { white-space:nowrap; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--brand);
+    margin-inline-end:4px; }
+
+  .rows .row-item { display:flex; align-items:center; gap:.6rem; padding:.5rem .9rem;
+    border-bottom:1px solid var(--border); color:var(--fg); }
+  .rows .row-item:last-child { border-bottom:0; }
+  .rows .row-item:hover { background:var(--hover); text-decoration:none; }
+  .ico { width:1em; color:var(--muted); }
+  .fname { font-family:var(--mono); font-size:.86rem; }
+  .right { margin-inline-start:auto; }
+  .commit { justify-content:space-between; }
+  .cmsg { font-weight:500; }
+  .sha { font-family:var(--mono); font-size:.8rem; color:var(--muted); border:1px solid var(--border);
+    padding:.15rem .4rem; border-radius:6px; }
+
+  .file-head { display:flex; justify-content:space-between; align-items:center; padding:.6rem .9rem;
+    border-bottom:1px solid var(--border); background:var(--bg); }
+  pre.code { margin:0; padding:.7rem 0 1.5rem; overflow-x:auto; font-family:var(--mono);
+    font-size:.82rem; line-height:1.6; }
+  pre.code .ln { display:inline-block; width:3.4em; padding-inline-end:1em; text-align:right;
+    color:var(--ln); user-select:none; }
+  footer { max-width:1080px; margin:0 auto; padding:1rem 1.1rem 3rem; color:var(--muted); font-size:.78rem; }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo"><span class="mark"></span>ParaFrames</span>
+  <nav>
+    <a href="#/" class="on">Code</a>
+    <a href="/live"><span class="dotlive"></span>Live</a>
+    <a href="/" target="_blank" rel="noreferrer">Forgejo</a>
+  </nav>
+  <span class="spacer"></span>
+  <span id="who"></span>
+</header>
+<div id="crumb"></div>
+<main id="main"></main>
+<footer>
+  Git hosting by Forgejo, read through its API. Live collaboration sessions are end-to-end
+  encrypted — the relay never sees their contents.
+</footer>
+<script src="/git.bundle.js"></script>
+</body>
+</html>

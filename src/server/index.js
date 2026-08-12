@@ -308,6 +308,35 @@ const server = http.createServer(async (req, res) => {
     return fs.createReadStream(full).pipe(res);
   }
 
+  // Our own git UI, over Forgejo's REST API. Same origin as Forgejo, so the API
+  // is reachable directly with no CORS and no proxy.
+  if (req.method === 'GET' && (req.url === '/app' || req.url.startsWith('/app?') || req.url.startsWith('/app#'))) {
+    let html;
+    try {
+      html = fs.readFileSync(new URL('./git.html', import.meta.url), 'utf8');
+    } catch {
+      return sendJson(res, 500, { error: 'git ui asset missing' });
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy':
+        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'",
+      'Referrer-Policy': 'no-referrer',
+    });
+    return res.end(html);
+  }
+
+  if (req.method === 'GET' && req.url === '/git.bundle.js') {
+    let js;
+    try {
+      js = fs.readFileSync(new URL('./git.bundle.js', import.meta.url));
+    } catch {
+      return sendJson(res, 500, { error: 'git bundle missing — run npm run build:git' });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' });
+    return res.end(js);
+  }
+
   if (req.method === 'GET' && req.url === '/viewer.bundle.js') {
     let js;
     try {
