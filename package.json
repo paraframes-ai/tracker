@@ -7,18 +7,23 @@
     "node": ">=18"
   },
   "bin": {
+    "tracker": "src/cli.js",
     "pf-sync": "src/daemon.js",
     "pf-relay": "src/relay.cjs"
   },
   "scripts": {
     "relay": "node src/relay.cjs",
-    "sync": "node src/daemon.js"
+    "server": "node src/server/index.js",
+    "sync": "node src/daemon.js",
+    "test": "node --test test/"
   },
   "dependencies": {
     "chokidar": "^3.6.0",
     "fast-diff": "^1.3.0",
+    "lib0": "^0.2.99",
     "picomatch": "^4.0.2",
     "ws": "^8.18.0",
+    "y-protocols": "^1.0.6",
     "y-websocket": "^2.0.4",
     "yjs": "^13.6.20"
   },

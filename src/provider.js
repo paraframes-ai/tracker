@@ -1,0 +1,302 @@
+// Encrypted Yjs provider.
+//
+// Replaces y-websocket's WebsocketProvider. The difference that matters: the old
+// relay held the authoritative Yjs document and answered sync requests itself.
+// This relay cannot — it only sees ciphertext — so peers sync *with each other*
+// and the relay is pure fan-out.
+//
+// Consequence for startup: whether we are "synced" is no longer "the server
+// replied", it is either "the relay told us we are alone in the room" (so there
+// is nothing to sync and we seed from disk) or "a peer sent us its state".
+// reconcile() depends on this being correct — declaring sync too early would let
+// us seed a room whose shared copy we had not yet seen.
+
+import * as Y from 'yjs';
+import WS from 'ws';
+import * as syncProtocol from 'y-protocols/sync';
+import * as awarenessProtocol from 'y-protocols/awareness';
+import * as encoding from 'lib0/encoding';
+import * as decoding from 'lib0/decoding';
+import { EventEmitter } from 'node:events';
+
+import {
+  FRAME,
+  PROTOCOL_VERSION,
+  decodeControl,
+  decodeFrame,
+  decodeSealed,
+  encodeControl,
+  encodeFrame,
+  encodeSealed,
+} from './protocol.js';
+import { importRoomKey, open, seal } from './crypto.js';
+
+const SYNC_TIMEOUT_MS = 10_000;
+const PING_INTERVAL_MS = 20_000;
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 15_000;
+
+export class EncryptedProvider extends EventEmitter {
+  constructor({ relay, owner, session, username, token, roomKey, doc, awareness, allow }) {
+    super();
+    this.relay = relay.replace(/\/+$/, '');
+    this.owner = owner;
+    this.session = session;
+    this.username = username;
+    this.token = token;
+    this.rawKey = roomKey;
+    this.doc = doc;
+    // Awareness runs its own outdated-state timer, so whoever creates it has to
+    // destroy it — otherwise the process keeps a live handle after destroy().
+    this._ownsAwareness = !awareness;
+    this.awareness = awareness ?? new awarenessProtocol.Awareness(doc);
+    this.allow = allow && allow.length ? allow : null;
+
+    this.key = null;
+    this.ws = null;
+    this.synced = false;
+    this.peers = new Set();
+    this.destroyed = false;
+    this.reconnectDelay = RECONNECT_BASE_MS;
+    this.pingTimer = null;
+
+    // Distinguishing "my key is wrong" from "some other peer's key is wrong".
+    // Only the former should be fatal: otherwise one peer connecting with a bad
+    // key takes down everyone else's session, which is a trivial denial of
+    // service against the room owner.
+    this.initialPeers = new Set();
+    this.decryptedOk = false;
+    this.badSenders = new Set();
+
+    this._syncedResolve = null;
+    this.whenSynced = new Promise((resolve) => {
+      this._syncedResolve = resolve;
+    });
+
+    this._onDocUpdate = (update, origin) => {
+      if (origin === this) return; // came from a peer; don't echo it back
+      const enc = encoding.createEncoder();
+      syncProtocol.writeUpdate(enc, update);
+      this._sendSealed(FRAME.CONTENT, encoding.toUint8Array(enc));
+    };
+    this.doc.on('update', this._onDocUpdate);
+
+    this._onAwarenessUpdate = ({ added, updated, removed }, origin) => {
+      if (origin === this) return;
+      const changed = added.concat(updated, removed);
+      const payload = awarenessProtocol.encodeAwarenessUpdate(this.awareness, changed);
+      this._sendSealed(FRAME.AWARENESS, payload);
+    };
+    this.awareness.on('update', this._onAwarenessUpdate);
+  }
+
+  ctxFor(sender) {
+    return { owner: this.owner, session: this.session, sender };
+  }
+
+  async connect() {
+    this.key = await importRoomKey(this.rawKey);
+    this._open();
+    return this;
+  }
+
+  _url() {
+    const base = this.relay.replace(/^http/, 'ws');
+    const url = `${base}/v${PROTOCOL_VERSION}/rooms/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.session)}`;
+    // The allowlist is applied by the relay at room creation, so it has to reach
+    // it on the connect URL — usernames are authenticated, so this is the one
+    // access check the relay can actually enforce.
+    return this.allow ? `${url}?allow=${encodeURIComponent(this.allow.join(','))}` : url;
+  }
+
+  _open() {
+    if (this.destroyed) return;
+    // Bearer token goes in a header, not the query string, so it stays out of
+    // the relay's access logs.
+    const ws = new WS(this._url(), { headers: { Authorization: `Bearer ${this.token}` } });
+    ws.binaryType = 'nodebuffer';
+    this.ws = ws;
+
+    ws.on('open', () => {
+      this.reconnectDelay = RECONNECT_BASE_MS;
+      this.emit('status', { status: 'connected' });
+      this.pingTimer = setInterval(() => {
+        if (ws.readyState === WS.OPEN) ws.send(encodeFrame(FRAME.PING));
+      }, PING_INTERVAL_MS);
+    });
+
+    ws.on('message', (data) => {
+      this._onMessage(data).catch((err) => this.emit('error', err));
+    });
+
+    ws.on('close', (code, reasonBuf) => {
+      clearInterval(this.pingTimer);
+      const reason = reasonBuf?.toString() || '';
+      this.emit('status', { status: 'disconnected', code, reason });
+      // 4001/4003/4004 are terminal: bad token, not allowed, no such room.
+      // Retrying those just spins, so surface them and stop.
+      if (code === 4001 || code === 4003 || code === 4004) {
+        this.emit('fatal', { code, reason });
+        return;
+      }
+      if (this.destroyed) return;
+      setTimeout(() => this._open(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+    });
+
+    ws.on('error', (err) => this.emit('status', { status: 'error', reason: err.message }));
+  }
+
+  async _onMessage(data) {
+    const { type, payload } = decodeFrame(data);
+
+    if (type === FRAME.PING) return;
+
+    if (type === FRAME.CONTROL) {
+      this._onControl(decodeControl(payload));
+      return;
+    }
+
+    if (type !== FRAME.CONTENT && type !== FRAME.AWARENESS) return;
+
+    const { sender, sealed } = decodeSealed(payload);
+    if (sender === this.username) return; // relay shouldn't echo, but don't trust it to
+    if (this.badSenders.has(sender)) return; // already known to be using a different key
+
+    let plaintext;
+    try {
+      plaintext = await open(this.key, type, this.ctxFor(sender), sealed);
+    } catch {
+      // Wrong key, tampering, or a relay lying about the sender all land here.
+      // Whose fault it is decides whether this is fatal: if we joined a room that
+      // already had peers and have never decrypted anything from one of them,
+      // it is our invite key that is wrong — the single most likely user error,
+      // so say so loudly and stop. Anything else means some *other* peer is using
+      // a different key, and we simply ignore them; treating that as fatal would
+      // let any stranger who can reach the room end the owner's session.
+      if (!this.decryptedOk && this.initialPeers.has(sender)) {
+        this.emit('fatal', {
+          code: 'BAD_KEY',
+          reason: 'invite key does not match this session (frame failed to decrypt)',
+        });
+      } else {
+        this.badSenders.add(sender);
+        this.emit('peer-key-mismatch', sender);
+      }
+      return;
+    }
+    this.decryptedOk = true;
+
+    if (type === FRAME.AWARENESS) {
+      awarenessProtocol.applyAwarenessUpdate(this.awareness, plaintext, this);
+      return;
+    }
+
+    const decoder = decoding.createDecoder(plaintext);
+    const reply = encoding.createEncoder();
+    const msgType = syncProtocol.readSyncMessage(decoder, reply, this.doc, this);
+    if (encoding.length(reply) > 0) {
+      this._sendSealed(FRAME.CONTENT, encoding.toUint8Array(reply));
+    }
+    // A step2 means a peer has handed us its state — that is what "synced" means
+    // when there is no authoritative server document.
+    if (msgType === syncProtocol.messageYjsSyncStep2) this._markSynced();
+  }
+
+  _onControl(msg) {
+    if (msg.type === 'hello') {
+      this.peers = new Set(msg.peers ?? []);
+      // Peers already present when we arrive are the ones whose frames we must
+      // be able to decrypt; a failure from them means our key is wrong.
+      this.initialPeers = new Set(this.peers);
+      // Room membership is re-established from scratch here, so forget any peer
+      // we had written off — otherwise a peer who reconnects with a corrected
+      // invite key stays permanently ignored.
+      this.badSenders.clear();
+      this.emit('peers', [...this.peers]);
+      if (this.peers.size === 0) {
+        // We are first in. Nothing to receive; our disk state seeds the room.
+        this._markSynced();
+      } else {
+        this._sendSyncStep1();
+        this._sendLocalAwareness();
+        setTimeout(() => {
+          if (!this.synced) {
+            this.emit('sync-timeout');
+            this._markSynced();
+          }
+        }, SYNC_TIMEOUT_MS);
+      }
+      return;
+    }
+
+    if (msg.type === 'peer-joined') {
+      this.peers.add(msg.peer);
+      // A fresh connection deserves a fresh judgement on its key.
+      this.badSenders.delete(msg.peer);
+      this.emit('peers', [...this.peers]);
+      // Exchange in both directions: their step1 tells us what they lack, ours
+      // tells them what we lack.
+      this._sendSyncStep1();
+      this._sendLocalAwareness();
+      return;
+    }
+
+    if (msg.type === 'peer-left') {
+      this.peers.delete(msg.peer);
+      this.badSenders.delete(msg.peer);
+      this.emit('peers', [...this.peers]);
+      return;
+    }
+
+    if (msg.type === 'error') {
+      this.emit('relay-error', msg);
+    }
+  }
+
+  _markSynced() {
+    if (this.synced) return;
+    this.synced = true;
+    this.emit('sync');
+    this._syncedResolve?.();
+  }
+
+  _sendSyncStep1() {
+    const enc = encoding.createEncoder();
+    syncProtocol.writeSyncStep1(enc, this.doc);
+    this._sendSealed(FRAME.CONTENT, encoding.toUint8Array(enc));
+  }
+
+  _sendLocalAwareness() {
+    const payload = awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
+      this.doc.clientID,
+    ]);
+    this._sendSealed(FRAME.AWARENESS, payload);
+  }
+
+  _sendSealed(type, plaintext) {
+    if (!this.key || this.ws?.readyState !== WS.OPEN) return;
+    seal(this.key, type, this.ctxFor(this.username), plaintext)
+      .then((sealed) => {
+        if (this.ws?.readyState === WS.OPEN) {
+          this.ws.send(encodeSealed(type, this.username, sealed));
+        }
+      })
+      .catch((err) => this.emit('error', err));
+  }
+
+  destroy() {
+    this.destroyed = true;
+    clearInterval(this.pingTimer);
+    this.doc.off('update', this._onDocUpdate);
+    this.awareness.off('update', this._onAwarenessUpdate);
+    if (this._ownsAwareness) this.awareness.destroy();
+    try {
+      this.ws?.close();
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+export { Y, awarenessProtocol };

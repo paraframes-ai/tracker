@@ -14,7 +14,7 @@ import os from 'node:os';
 // Only these files are synced in real time. Everything else (project.pbxproj,
 // build output, images, ...) is left to git — char-level CRDT merging would
 // corrupt structured/binary files.
-const DEFAULT_INCLUDE = [
+export const DEFAULT_INCLUDE = [
   '**/*.swift',
   '**/*.h',
   '**/*.m',
@@ -29,7 +29,7 @@ const DEFAULT_INCLUDE = [
   '**/*.entitlements',
 ];
 
-const DEFAULT_EXCLUDE = [
+export const DEFAULT_EXCLUDE = [
   '**/.git/**',
   '**/DerivedData/**',
   '**/build/**',
