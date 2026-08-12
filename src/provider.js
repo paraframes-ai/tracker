@@ -35,6 +35,9 @@ const SYNC_TIMEOUT_MS = 10_000;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 15_000;
+// How long a connection must survive before we consider it healthy enough to
+// reset the reconnect backoff.
+const CONNECTION_STABLE_MS = 5_000;
 
 export class EncryptedProvider extends EventEmitter {
   constructor({ relay, owner, session, username, token, roomKey, doc, awareness, allow }) {
@@ -117,8 +120,8 @@ export class EncryptedProvider extends EventEmitter {
     ws.binaryType = 'nodebuffer';
     this.ws = ws;
 
+    const openedAt = Date.now();
     ws.on('open', () => {
-      this.reconnectDelay = RECONNECT_BASE_MS;
       this.emit('status', { status: 'connected' });
       this.pingTimer = setInterval(() => {
         if (ws.readyState === WS.OPEN) ws.send(encodeFrame(FRAME.PING));
@@ -139,7 +142,25 @@ export class EncryptedProvider extends EventEmitter {
         this.emit('fatal', { code, reason });
         return;
       }
+      // An oversized frame is not transient: reconnecting resends exactly the
+      // same data and gets refused identically. Say something actionable instead
+      // of looping forever looking connected.
+      if (reason === 'maxFrameBytes') {
+        this.emit('fatal', {
+          code,
+          reason:
+            'this project is too large for the relay to sync in one message ' +
+            '(initial sync exceeded the relay frame limit)',
+        });
+        return;
+      }
       if (this.destroyed) return;
+      // Only treat the connection as healthy — and reset backoff — if it actually
+      // stayed up. Resetting on 'open' meant a connection that died immediately
+      // reconnected at full speed forever instead of backing off.
+      if (Date.now() - openedAt > CONNECTION_STABLE_MS) {
+        this.reconnectDelay = RECONNECT_BASE_MS;
+      }
       setTimeout(() => this._open(), this.reconnectDelay);
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
     });

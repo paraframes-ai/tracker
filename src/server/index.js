@@ -178,6 +178,11 @@ function onConnection(ws, claims, { owner, session }, req) {
   const conn = { ws, username, limiter: new RateLimiter() };
 
   const fail = (code, reason) => {
+    // Log every refusal. Without this a peer can be rejected hundreds of times
+    // while the relay log shows nothing but healthy-looking joins and leaves,
+    // which is exactly how a quota misconfiguration hid as "it just doesn't
+    // sync".
+    log(`refused ${username} on ${owner}/${session}: ${code} ${reason}`);
     try {
       ws.send(encodeControl({ type: 'error', code, reason }));
     } catch {

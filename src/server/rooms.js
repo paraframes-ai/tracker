@@ -11,10 +11,25 @@
 
 export const LIMITS = {
   peersPerRoom: 8,
-  maxFrameBytes: 1024 * 1024,
+
+  // The first sync frame a peer sends carries the *entire* document, so this
+  // scales with project size, not with edit size. 1 MiB looked generous and was
+  // not: a 115-file project produced a frame well past it, the relay closed the
+  // sender, it reconnected, and the two peers never finished syncing.
+  //
+  // Chunking the initial sync is the real fix and needs a protocol change; until
+  // then this has to comfortably exceed a realistic project's text.
+  maxFrameBytes: 32 * 1024 * 1024,
+
   framesPerSecond: 200,
   frameBurst: 1000,
-  bytesPerSecond: 2 * 1024 * 1024,
+
+  // Refill rate for sustained traffic, kept modest...
+  bytesPerSecond: 4 * 1024 * 1024,
+  // ...but the bucket has to be deep enough to admit one maximum-size frame, or
+  // a legitimate initial sync is refused no matter how long the peer waits.
+  byteBurst: 32 * 1024 * 1024,
+
   roomsPerUser: 20,
   connectionsPerUser: 10,
   idleRoomTtlMs: 10 * 60 * 1000,
@@ -97,9 +112,10 @@ export class Rooms {
 // volume, because a client can abuse either dimension independently.
 export class RateLimiter {
   constructor(limits = LIMITS) {
-    this.frames = limits.frameBurst;
-    this.bytes = limits.bytesPerSecond;
     this.limits = limits;
+    this.byteCapacity = limits.byteBurst ?? limits.bytesPerSecond;
+    this.frames = limits.frameBurst;
+    this.bytes = this.byteCapacity;
     this.last = Date.now();
   }
 
@@ -112,10 +128,7 @@ export class RateLimiter {
       this.limits.frameBurst,
       this.frames + elapsed * this.limits.framesPerSecond,
     );
-    this.bytes = Math.min(
-      this.limits.bytesPerSecond,
-      this.bytes + elapsed * this.limits.bytesPerSecond,
-    );
+    this.bytes = Math.min(this.byteCapacity, this.bytes + elapsed * this.limits.bytesPerSecond);
     if (frameBytes > this.limits.maxFrameBytes) return 'maxFrameBytes';
     if (this.frames < 1) return 'framesPerSecond';
     if (this.bytes < frameBytes) return 'bytesPerSecond';
