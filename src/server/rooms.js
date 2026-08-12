@@ -106,6 +106,34 @@ export class Rooms {
     for (const conn of room.conns) if (conn !== except) names.add(conn.username);
     return [...names];
   }
+
+  // Metadata only. Deliberately no file names, no counts of files, nothing
+  // derived from frame payloads — the relay cannot see them, and a dashboard
+  // must not imply otherwise.
+  snapshot(forUsername) {
+    const out = [];
+    for (const room of this.rooms.values()) {
+      const peers = [...room.conns];
+      const involved = room.owner === forUsername || peers.some((c) => c.username === forUsername);
+      if (!involved) continue;
+      out.push({
+        id: Rooms.id(room.owner, room.session),
+        owner: room.owner,
+        session: room.session,
+        allow: room.allow ? [...room.allow] : null,
+        peerCount: peers.length,
+        peers: peers.map((c) => ({
+          username: c.username,
+          joinedAt: c.joinedAt,
+          bytesIn: c.bytesIn,
+          bytesOut: c.bytesOut,
+          frames: c.frames,
+          lastActiveAt: c.lastActiveAt,
+        })),
+      });
+    }
+    return out.sort((a, b) => b.peerCount - a.peerCount || a.id.localeCompare(b.id));
+  }
 }
 
 // Token bucket, refilled continuously. Separate buckets for frame count and byte

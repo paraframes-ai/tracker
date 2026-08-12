@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParaFrames Live — sessions</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfc; --panel: #fff; --border: #e3e5e9; --fg: #16181d;
+    --muted: #6b7280; --live: #14804a; --idle: #9ca3af; --warn: #b42318;
+    --accent: #2f5bd7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --panel: #16181d; --border: #262a32; --fg: #e6e8ec;
+      --muted: #9aa1ad; --live: #3fbf7f; --idle: #6b7280; --warn: #ff7b72;
+      --accent: #7aa2f7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 .2rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: .875rem; margin-bottom: 1.75rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .sess-head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .sess-id { font-family: var(--mono); font-size: .95rem; font-weight: 600; }
+  .badge { font-size: .75rem; padding: .1rem .5rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .live { color: var(--live); border-color: color-mix(in srgb, var(--live) 40%, transparent); }
+  .idle { color: var(--idle); }
+  table { width: 100%; border-collapse: collapse; margin-top: .8rem; }
+  th, td { text-align: left; padding: .4rem .5rem; border-top: 1px solid var(--border); font-size: .85rem; }
+  th { color: var(--muted); font-weight: 500; border-top: 0; }
+  td.num { font-family: var(--mono); text-align: right; }
+  .who { font-family: var(--mono); }
+  button {
+    font: inherit; padding: .5rem .9rem; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--accent); color: #fff; font-weight: 500;
+  }
+  button.ghost { background: transparent; color: var(--fg); }
+  code { font-family: var(--mono); background: color-mix(in srgb, var(--fg) 8%, transparent); padding: .1rem .35rem; border-radius: 4px; }
+  .code-big { font-family: var(--mono); font-size: 1.5rem; letter-spacing: .12em; font-weight: 600; }
+  .muted { color: var(--muted); }
+  .warn { color: var(--warn); }
+  .row { display: flex; justify-content: space-between; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: .85rem; color: var(--muted); }
+  .stats b { color: var(--fg); font-family: var(--mono); font-weight: 600; }
+  .note { font-size: .8rem; color: var(--muted); margin-top: 1.5rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ParaFrames Live</h1>
+  <div class="sub">Live session metadata. The relay cannot read file contents — see the note below.</div>
+  <div id="app"></div>
+  <div class="note">
+    Everything here is metadata the relay legitimately holds: who is connected, when,
+    and how many bytes moved. File names and contents are encrypted end-to-end and are
+    never visible to the relay or to this page.
+  </div>
+</div>
+<script>
+const app = document.getElementById('app');
+const KEY = 'tracker.dashboard.token';
+let token = localStorage.getItem(KEY) || '';
+let timer = null;
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const bytes = (n) => {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(2) + ' MB';
+};
+const ago = (t, now) => {
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h';
+};
+
+function renderLogin(msg) {
+  clearInterval(timer);
+  app.innerHTML = `<div class="card">
+    <div class="row"><div><b>Sign in with GitHub</b><div class="muted" style="font-size:.85rem">
+    Needed to see your own sessions. Uses the same device flow as the CLI.</div></div>
+    <button id="go">Sign in</button></div>
+    ${msg ? `<div class="warn" style="margin-top:.8rem">${esc(msg)}</div>` : ''}</div>`;
+  document.getElementById('go').onclick = startDeviceFlow;
+}
+
+async function startDeviceFlow() {
+  app.innerHTML = '<div class="card muted">Requesting a device code…</div>';
+  let start;
+  try {
+    const r = await fetch('/v1/auth/device/start', { method: 'POST' });
+    start = await r.json();
+    if (!r.ok) throw new Error(start.error || 'failed to start');
+  } catch (e) { return renderLogin(e.message); }
+
+  app.innerHTML = `<div class="card">
+    <div>Open <a href="${esc(start.verification_uri)}" target="_blank" rel="noreferrer">${esc(start.verification_uri)}</a> and enter:</div>
+    <div class="code-big" style="margin:.7rem 0">${esc(start.user_code)}</div>
+    <div class="muted" id="poll">Waiting for authorization…</div></div>`;
+
+  const interval = (start.interval || 5) * 1000;
+  const deadline = Date.now() + 15 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, interval));
+    let j, r;
+    try {
+      r = await fetch('/v1/auth/device/poll', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_code: start.device_code }),
+      });
+      j = await r.json();
+    } catch { continue; }
+    if (r.status === 200 && j.token) {
+      token = j.token; localStorage.setItem(KEY, token);
+      return load();
+    }
+    if (r.status !== 202) return renderLogin(j.error || 'authorization failed');
+  }
+  renderLogin('timed out — try again');
+}
+
+function render(d) {
+  const rows = d.sessions.map((s) => {
+    const live = s.peerCount > 0;
+    const peers = s.peers.map((p) => `<tr>
+      <td class="who">${esc(p.username)}</td>
+      <td class="num">${ago(p.joinedAt, d.now)}</td>
+      <td class="num">${ago(p.lastActiveAt, d.now)} ago</td>
+      <td class="num">${bytes(p.bytesIn)}</td>
+      <td class="num">${bytes(p.bytesOut)}</td>
+      <td class="num">${p.frames}</td></tr>`).join('');
+    return `<div class="card">
+      <div class="sess-head">
+        <span class="sess-id">${esc(s.id)}</span>
+        <span class="badge ${live ? 'live' : 'idle'}">${live ? '● ' + s.peerCount + ' peer' + (s.peerCount > 1 ? 's' : '') : '○ idle'}</span>
+        ${s.allow ? `<span class="badge">allow: ${esc(s.allow.join(', '))}</span>` : ''}
+      </div>
+      ${peers ? `<table><tr><th>peer</th><th>connected</th><th>last active</th><th>in</th><th>out</th><th>frames</th></tr>${peers}</table>`
+              : '<div class="muted" style="margin-top:.5rem">No peers connected.</div>'}
+    </div>`;
+  }).join('');
+
+  const refusals = d.refusals.length
+    ? `<div class="card"><b class="warn">Recent refusals (${d.refusals.length})</b><table>
+        <tr><th>when</th><th>peer</th><th>session</th><th>reason</th></tr>
+        ${d.refusals.slice().reverse().map((r) => `<tr><td class="num">${ago(r.at, d.now)} ago</td>
+          <td class="who">${esc(r.username)}</td><td class="who">${esc(r.room)}</td>
+          <td class="warn">${esc(r.code)} ${esc(r.reason)}</td></tr>`).join('')}</table></div>`
+    : '';
+
+  app.innerHTML = `<div class="card"><div class="row">
+      <div class="stats">
+        <span>signed in <b>${esc(d.you)}</b></span>
+        <span>sessions <b>${d.sessions.length}</b></span>
+        <span>relay up <b>${ago(d.startedAt, d.now)}</b></span>
+        <span>max frame <b>${bytes(d.limits.maxFrameBytes)}</b></span>
+      </div>
+      <button class="ghost" id="out">Sign out</button>
+    </div></div>
+    ${rows || '<div class="card muted">No sessions yet. Run <code>tracker share</code> to start one.</div>'}
+    ${refusals}`;
+  document.getElementById('out').onclick = () => {
+    localStorage.removeItem(KEY); token = ''; renderLogin();
+  };
+}
+
+async function load() {
+  if (!token) return renderLogin();
+  try {
+    const r = await fetch('/v1/sessions', { headers: { Authorization: 'Bearer ' + token } });
+    if (r.status === 401) { localStorage.removeItem(KEY); token = ''; return renderLogin('Session expired — sign in again.'); }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    render(await r.json());
+  } catch (e) {
+    app.innerHTML = `<div class="card warn">Could not reach the relay: ${esc(e.message)}</div>`;
+  }
+  clearInterval(timer);
+  timer = setInterval(load, 3000);
+}
+
+load();
+</script>
+</body>
+</html>

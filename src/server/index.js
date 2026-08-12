@@ -45,6 +45,14 @@ function signingKeyPem() {
   return process.env.TRACKER_JWT_PRIVATE_KEY;
 }
 
+// Same public client id the CLI compiles in (device flow has no secret).
+const GITHUB_CLIENT_ID = process.env.TRACKER_GITHUB_CLIENT_ID || 'Ov23liRkXOV0SuKwsR5M';
+
+const SERVER_STARTED_AT = Date.now();
+// Recent refusals, capped — enough to answer "why is this not syncing" without
+// becoming an unbounded log in memory.
+const refusals = [];
+
 const keys = loadOrCreateKeyPair(signingKeyPem());
 const ephemeralKey = !process.env.TRACKER_JWT_PRIVATE_KEY_FILE && !process.env.TRACKER_JWT_PRIVATE_KEY;
 const rooms = new Rooms();
@@ -131,6 +139,98 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // --- dashboard -----------------------------------------------------------
+
+  if (req.method === 'GET' && (req.url === '/dashboard' || req.url === '/dashboard/')) {
+    let html;
+    try {
+      html = fs.readFileSync(new URL('./dashboard.html', import.meta.url), 'utf8');
+    } catch {
+      return sendJson(res, 500, { error: 'dashboard asset missing' });
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      // The dashboard is same-origin and self-contained; no external anything.
+      'Content-Security-Policy':
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      'Referrer-Policy': 'no-referrer',
+    });
+    return res.end(html);
+  }
+
+  // GitHub's device endpoints send no CORS headers, so a browser cannot call
+  // them directly. The relay proxies the two steps. No client secret is
+  // involved — device flow does not use one.
+  if (req.method === 'POST' && req.url === '/v1/auth/device/start') {
+    try {
+      const r = await fetch('https://github.com/login/device/code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, scope: '' }),
+      });
+      const j = await r.json();
+      if (j.error) return sendJson(res, 400, { error: j.error_description || j.error });
+      return sendJson(res, 200, {
+        device_code: j.device_code,
+        user_code: j.user_code,
+        verification_uri: j.verification_uri,
+        interval: j.interval || 5,
+      });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  if (req.method === 'POST' && req.url === '/v1/auth/device/poll') {
+    try {
+      const { device_code } = await readJson(req);
+      if (!device_code) return sendJson(res, 400, { error: 'device_code required' });
+      const r = await fetch('https://github.com/login/oauth/access_token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          client_id: GITHUB_CLIENT_ID,
+          device_code,
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        }),
+      });
+      const j = await r.json();
+      if (j.access_token) {
+        const ident = await githubIdentity(j.access_token);
+        const token = sign({ ...ident, privateKey: keys.privateKey, ttlSeconds: TTL_DAYS * 86400 });
+        log(`issued token for ${ident.username} (browser)`);
+        return sendJson(res, 200, { token, username: ident.username });
+      }
+      if (j.error === 'authorization_pending' || j.error === 'slow_down') {
+        return sendJson(res, 202, { pending: true, error: j.error });
+      }
+      return sendJson(res, 400, { error: j.error_description || j.error || 'device flow failed' });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  // Live session metadata, scoped to what the caller is actually part of.
+  if (req.method === 'GET' && req.url.startsWith('/v1/sessions')) {
+    const auth = req.headers['authorization'] || '';
+    const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    let claims;
+    try {
+      claims = verify(bearer, keys.publicKey);
+    } catch {
+      return sendJson(res, 401, { error: 'unauthenticated' });
+    }
+    const username = String(claims.username).toLowerCase();
+    return sendJson(res, 200, {
+      you: username,
+      now: Date.now(),
+      startedAt: SERVER_STARTED_AT,
+      limits: { peersPerRoom: LIMITS.peersPerRoom, maxFrameBytes: LIMITS.maxFrameBytes },
+      refusals: refusals.slice(-25),
+      sessions: rooms.snapshot(username),
+    });
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found\n');
 });
@@ -175,7 +275,17 @@ server.on('upgrade', (req, socket, head) => {
 
 function onConnection(ws, claims, { owner, session }, req) {
   const username = String(claims.username).toLowerCase();
-  const conn = { ws, username, limiter: new RateLimiter() };
+  const now = Date.now();
+  const conn = {
+    ws,
+    username,
+    limiter: new RateLimiter(),
+    joinedAt: now,
+    lastActiveAt: now,
+    bytesIn: 0,
+    bytesOut: 0,
+    frames: 0,
+  };
 
   const fail = (code, reason) => {
     // Log every refusal. Without this a peer can be rejected hundreds of times
@@ -183,6 +293,8 @@ function onConnection(ws, claims, { owner, session }, req) {
     // which is exactly how a quota misconfiguration hid as "it just doesn't
     // sync".
     log(`refused ${username} on ${owner}/${session}: ${code} ${reason}`);
+    refusals.push({ at: Date.now(), username, room: `${owner}/${session}`, code, reason });
+    if (refusals.length > 100) refusals.shift();
     try {
       ws.send(encodeControl({ type: 'error', code, reason }));
     } catch {
@@ -259,9 +371,16 @@ function onConnection(ws, claims, { owner, session }, req) {
     }
     if (sender !== username) return fail(CLOSE.BAD_FRAME, 'sender does not match token');
 
+    conn.bytesIn += data.length;
+    conn.frames += 1;
+    conn.lastActiveAt = Date.now();
+
     for (const peer of room.conns) {
       if (peer === conn) continue;
-      if (peer.ws.readyState === peer.ws.OPEN) peer.ws.send(data, { binary: true });
+      if (peer.ws.readyState === peer.ws.OPEN) {
+        peer.ws.send(data, { binary: true });
+        peer.bytesOut += data.length;
+      }
     }
   });
 
