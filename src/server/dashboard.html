@@ -109,7 +109,8 @@ function renderLogin(msg) {
         Create a token at ${link}, then paste it here. It is exchanged once for a
         session token and never stored by the relay.</div>
       <div class="row">
-        <input id="fjt" type="password" placeholder="Forgejo access token" autocomplete="off"
+        <input id="fjt" type="text" spellcheck="false" autocapitalize="off" autocorrect="off"
+          autocomplete="off" placeholder="paste Forgejo access token"
           style="flex:1;min-width:240px;padding:.5rem .6rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-family:var(--mono)">
         <button id="fjgo">Sign in</button>
       </div>${err}</div>`;
