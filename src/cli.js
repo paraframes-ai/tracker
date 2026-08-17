@@ -17,7 +17,8 @@ import { clearAuth, devLogin, forgejoLogin, loadAuth, login, readSecretFromStdin
 import { fromBase64Url, generateRoomKey, toBase64Url } from './crypto.js';
 import { previewScan, runSync } from './daemon.js';
 import { DEFAULT_EXCLUDE, DEFAULT_INCLUDE } from './config.js';
-import { accountsUrlFor, channel, channelName } from './channel.js';
+import { CLI_CLIENT_ID, accountsUrlFor, channel, channelName } from './channel.js';
+import { browserLogin } from './oauth.js';
 import {
   ensureStateDir,
   listSessions,
@@ -120,7 +121,7 @@ function findSessions(target, { root } = {}) {
 // an entire home directory, in both directions, with no confirmation.
 
 const KNOWN_FLAGS = {
-  login: ['relay', 'forgejo-token', 'dev'],
+  login: ['relay', 'forgejo-token', 'dev', 'git-host'],
   logout: [],
   whoami: [],
   version: [],
@@ -260,13 +261,20 @@ async function cmdLogin(flags) {
     console.log(`✓ logged in as ${out.username} (dev token, relay ${relay})`);
     return;
   }
-  const out = await login({
-    relay,
-    onPrompt: ({ uri, code }) => {
-      console.log(`→ visit ${uri} and enter code: ${code}`);
-      console.log('  waiting for authorization...');
+  // Default: sign in through the browser against the git host. Nothing to paste;
+  // the user is usually already signed in there, so it is one click.
+  const gitHost = flags['git-host'] || channel.gitHost;
+  if (!gitHost) die('no git host configured for this build — use --git-host=<url>');
+
+  const forgejoToken = await browserLogin({
+    forgejoUrl: gitHost,
+    clientId: CLI_CLIENT_ID,
+    onPrompt: (url) => {
+      console.log('→ opening your browser to sign in…');
+      console.log(`  if it did not open, visit:\n  ${url}`);
     },
   });
+  const out = await forgejoLogin({ relay, forgejoToken });
   console.log(`✓ logged in as ${out.username}`);
 }
 
@@ -455,8 +463,9 @@ async function cmdSync() {
 function usage() {
   console.log(`tracker — real-time collaborative file sync
 
-  tracker login                        authenticate (GitHub device flow)
-      --forgejo-token[=<t>]            authenticate with a Forgejo access token
+  tracker login                        sign in via your browser (no token needed)
+      --git-host=<url>                 git host to authenticate against
+      --forgejo-token[=<t>]            headless: use an access token instead
                                        (omit the value to read it from stdin)
       --dev=<username>                 dev-only, needs TRACKER_DEV_AUTH=1
   tracker logout                       forget the stored token

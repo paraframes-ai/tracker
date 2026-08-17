@@ -66,9 +66,17 @@ const FORGEJO_API = (process.env.TRACKER_FORGEJO_API || 'http://127.0.0.1:3000')
 // Resolve a Forgejo access token to an identity. The token is used once and
 // never stored, exactly as with the GitHub path.
 async function forgejoIdentity(accessToken) {
-  const res = await fetch(`${FORGEJO_API}/api/v1/user`, {
+  // Personal access tokens use `token <t>`; OAuth2 access tokens use `Bearer <t>`.
+  // Trying both lets one endpoint serve the pasted-token path and the browser
+  // sign-in path without the client having to say which it has.
+  let res = await fetch(`${FORGEJO_API}/api/v1/user`, {
     headers: { Authorization: `token ${accessToken}`, Accept: 'application/json' },
   });
+  if (res.status === 401 || res.status === 403) {
+    res = await fetch(`${FORGEJO_API}/api/v1/user`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    });
+  }
   if (!res.ok) throw new Error(`forgejo rejected the token (${res.status})`);
   const user = await res.json();
   if (!user?.login || !user?.id) throw new Error('forgejo returned no login');

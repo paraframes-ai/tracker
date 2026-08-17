@@ -14,6 +14,11 @@
 
 const CHANNEL = typeof TRACKER_CHANNEL !== 'undefined' ? TRACKER_CHANNEL : 'internal';
 
+// Public OAuth client for browser sign-in from the CLI. No secret: it is a
+// native app using PKCE, and the id ships in every binary by design.
+export const CLI_CLIENT_ID =
+  process.env.TRACKER_CLI_CLIENT_ID || '032a8690-8f25-4251-add5-d396f48a77e9';
+
 // Written as a branch on a build-time constant rather than a lookup table, so
 // the bundler folds the comparison and drops the unused channel entirely. With a
 // table, both channels' URLs survive into every binary and `strings` on a public
@@ -38,6 +43,9 @@ export const channel =
         // Where a pilot gets a token. Derived from the relay origin would be
         // wrong — identity lives on the git host, not the relay.
         accounts: 'https://git.paraframes.org/user/settings/applications',
+        // The git host to sign in against. Same for both channels: identity lives
+        // on the git host, not the relay.
+        gitHost: 'https://git.paraframes.org',
         docs: 'https://github.com/paraframes-ai/tracker#readme',
       }
     : {
@@ -47,6 +55,7 @@ export const channel =
         dashboard: 'https://git.paraframes.org/live',
         downloads: 'https://live.paraframes.org/dl/',
         accounts: 'https://git.paraframes.org/user/settings/applications',
+        gitHost: 'https://git.paraframes.org',
         docs: 'https://git.paraframes.org/app',
       };
 
