@@ -72,7 +72,18 @@ export const DEFAULT_EXCLUDE = [
   // a secret to a collaborator is worse than the inconvenience of it not syncing.
   '**/.ssh/**', '**/.aws/**', '**/.gnupg/**', '**/.netrc',
   '**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.keystore',
-  '**/.config/**',
+  '**/.config/**', '**/.npmrc', '**/.pypirc', '**/.docker/**',
+
+  // Agent and editor state directories. Delegating to .gitignore is right for
+  // build output and wrong for these: they routinely hold API tokens and are
+  // routinely *not* gitignored, so git offers them up as ordinary project files.
+  // Observed in practice — a peer with a mis-set root replicated .gemini/ and
+  // .copilot/ into a collaborator's checkout twice.
+  //
+  // .claude/ also holds worktrees: whole duplicate checkouts that would sync as
+  // if they were real files.
+  '**/.claude/**', '**/.gemini/**', '**/.copilot/**', '**/.cursor/**',
+  '**/.codeium/**', '**/.continue/**', '**/.aider*',
 ];
 
 function parseCliFlags(argv) {

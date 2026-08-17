@@ -31,6 +31,7 @@ import { promisify } from 'node:util';
 import * as Y from 'yjs';
 import chokidar from 'chokidar';
 import diff from 'fast-diff';
+import DiffMatchPatch from 'diff-match-patch';
 import picomatch from 'picomatch';
 
 import { detectEol, fromLf, platformEol, toLf } from './eol.js';
@@ -160,6 +161,34 @@ export async function runSync(config) {
   // git's view of the project, when there is one.
   let gitSet = null;
   const ignoreCache = new Map();
+  // Paths a peer offered that our own rules forbid; tracked so the warning is
+  // logged once each rather than on every update.
+  const refusedIncoming = new Set();
+  // Per-file "base": the content this machine last knew both sides agreed on —
+  // the last thing we wrote to disk, or the last thing we successfully published.
+  // A local save is only meaningful *relative to this*, which is what makes a
+  // three-way merge possible.
+  const baseByFile = new Map();
+  // The disk content *immediately before* the most recent remote write. An editor
+  // that has not reloaded is still working from this, not from what we wrote — so
+  // this, not the file on disk, is the base its next save should be judged
+  // against.
+  const preRemoteByFile = new Map();
+  const dmp = new DiffMatchPatch();
+
+  // Did a remote write introduce text that this saved buffer clearly never saw?
+  // If so the editor is stale and its save must be merged, not trusted. If the
+  // text *is* present the editor reloaded, and the ordinary path is correct —
+  // getting this wrong the other way would duplicate the remote insertion.
+  function editorLooksStale(local, pre, agreed) {
+    if (pre === undefined || pre === agreed) return false;
+    const introduced = diff(pre, agreed)
+      .filter(([op]) => op === diff.INSERT)
+      .map(([, text]) => text)
+      .filter((text) => text.trim().length > 2);
+    if (!introduced.length) return false;
+    return !introduced.every((text) => local.includes(text));
+  }
 
   // -------------------------------------------------------------------------
   // file helpers
@@ -265,6 +294,9 @@ export async function runSync(config) {
   }
 
   async function writeToDisk(rel) {
+    // Belt and braces: nothing excluded should ever reach the disk, whichever
+    // path got us here.
+    if (!shouldSync(rel)) return;
     const ytext = files.get(rel);
     if (!ytext) return;
     const content = ytext.toString(); // canonical LF
@@ -275,6 +307,9 @@ export async function runSync(config) {
     } catch {
       /* new file */
     }
+    // Remember what an unreloaded editor would still be holding, before we
+    // replace it on disk.
+    if (cur !== null) preRemoteByFile.set(rel, toLf(cur));
     // Compare in the CRDT's space, not the disk's, or a CRLF file would look
     // different on every single check and rewrite forever.
     if (cur !== null && toLf(cur) === content) return; // already current (also swallows our own echo)
@@ -282,6 +317,7 @@ export async function runSync(config) {
     eolByFile.set(rel, eol);
     await fsp.mkdir(path.dirname(abs), { recursive: true });
     await fsp.writeFile(abs, fromLf(content, eol), 'utf8');
+    baseByFile.set(rel, content);
     log(`⇩ ${rel}`);
   }
 
@@ -302,6 +338,17 @@ export async function runSync(config) {
   files.observe((event, tr) => {
     for (const [key, change] of event.keys) {
       if (change.action === 'add') {
+        // The exclude list has to apply to *incoming* files too, not only to what
+        // we upload. Otherwise a peer whose root is wrong — a home directory, say
+        // — writes their .config/, .ssh/ and .env straight onto our disk, and our
+        // own credential exclusions protect nobody.
+        if (!shouldSync(key)) {
+          if (!refusedIncoming.has(key)) {
+            refusedIncoming.add(key);
+            warn(`refusing ${key} from peer — excluded locally`);
+          }
+          continue;
+        }
         ensureObserved(key);
         if (tr.origin !== LOCAL) scheduleDiskWrite(key);
       } else if (change.action === 'delete') {
@@ -337,8 +384,55 @@ export async function runSync(config) {
         files.set(rel, ytext);
       }, LOCAL);
       ensureObserved(rel);
+      setYText(ytext, read.text);
+      baseByFile.set(rel, read.text);
+      return;
     }
-    setYText(ytext, read.text);
+
+    const remote = ytext.toString();
+    const local = read.text;
+    if (remote === local) {
+      baseByFile.set(rel, local);
+      return;
+    }
+
+    const agreed = baseByFile.has(rel) ? baseByFile.get(rel) : remote;
+    const pre = preRemoteByFile.get(rel);
+    // A stale editor's save looks, on disk, exactly like a deliberate revert.
+    // Distinguishing them is the whole difficulty; see editorLooksStale.
+    const base = editorLooksStale(local, pre, agreed) ? pre : agreed;
+
+    // Nothing arrived from a peer since we last agreed, so the saved file is a
+    // straightforward advance on the shared state.
+    if (remote === base) {
+      setYText(ytext, local);
+      baseByFile.set(rel, local);
+      return;
+    }
+
+    // Otherwise both sides moved. Treating the saved file as truth here is what
+    // silently erased peers' edits: an editor writes the whole buffer, including
+    // the parts it never saw change. So publish only *this* editor's delta
+    // (base -> local) applied on top of the shared state.
+    const patches = dmp.patch_make(base, local);
+    const [merged, applied] = dmp.patch_apply(patches, remote);
+    const clean = applied.every(Boolean);
+
+    if (!clean) {
+      // Genuinely overlapping edits. Keep a copy of what this machine saved
+      // before the merge replaces it, so nothing is lost silently.
+      await backupToTrash(rel).catch(() => {});
+      warn(
+        `${rel}: your save overlapped a change from a collaborator — merged, ` +
+          `your version saved to .pf-sync-trash/`,
+      );
+    }
+
+    setYText(ytext, merged);
+    baseByFile.set(rel, merged);
+    // Put the merged result on disk too, or the editor keeps a buffer that
+    // disagrees with the shared state and re-fights on every save.
+    if (merged !== local) scheduleDiskWrite(rel);
   }
 
   function onLocalUnlink(abs) {
@@ -360,6 +454,7 @@ export async function runSync(config) {
     for (const rel of crdtKeys) {
       ensureObserved(rel);
       const remote = files.get(rel).toString();
+      baseByFile.set(rel, remote);
       if (!disk.has(rel)) {
         await writeToDisk(rel); // peer has a file we don't — pull it down
       } else if (disk.get(rel) !== remote) {
@@ -382,6 +477,7 @@ export async function runSync(config) {
         files.set(rel, ytext);
       }, LOCAL);
       ensureObserved(rel);
+      baseByFile.set(rel, content);
     }
 
     log(`reconciled: ${files.size} file(s) in the shared session`);
