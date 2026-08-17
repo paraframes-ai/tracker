@@ -85,6 +85,24 @@ async function forgejoIdentity(accessToken) {
 
 const SERVER_STARTED_AT = Date.now();
 
+// Minimum client version this relay will serve. Two of the worst debugging
+// sessions in this project's short life were an old binary against a new relay,
+// silently doing something else. Refusing with a specific message costs one
+// comparison and saves an hour.
+const MIN_CLIENT = process.env.TRACKER_MIN_CLIENT || '0.1.3';
+const UPGRADE_URL = process.env.TRACKER_UPGRADE_URL || 'https://live.paraframes.org/dl/';
+
+const parseVersion = (v) => String(v || '').split('.').map((n) => parseInt(n, 10) || 0);
+function olderThan(version, minimum) {
+  const a = parseVersion(version);
+  const b = parseVersion(minimum);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] || 0) < (b[i] || 0)) return true;
+    if ((a[i] || 0) > (b[i] || 0)) return false;
+  }
+  return false;
+}
+
 // Cloudflare's Browser Cache TTL rewrites our Cache-Control on static assets
 // (4 hours by default), so a browser will happily serve a stale bundle after a
 // deploy no matter what the origin asked for. Referencing each bundle by a
@@ -541,6 +559,15 @@ server.on('upgrade', (req, socket, head) => {
   const target = parseRoomPath(req.url || '');
   if (!target) return reject(400, 'Bad Request');
 
+  // Clients identify themselves as ?client=tracker/<version>. Absent means a
+  // browser (the viewer), which is versioned with the relay and always current.
+  const clientParam = new URL(req.url, 'http://localhost').searchParams.get('client') || '';
+  const clientVersion = clientParam.startsWith('tracker/') ? clientParam.slice(8) : null;
+  if (clientVersion && olderThan(clientVersion, MIN_CLIENT)) {
+    log(`refused old client ${clientVersion} (needs >= ${MIN_CLIENT})`);
+    return reject(426, `Upgrade Required: tracker ${clientVersion} is too old, need ${MIN_CLIENT} - ${UPGRADE_URL}`);
+  }
+
   const bearer = bearerFrom(req);
   if (!bearer) return reject(401, 'Unauthorized');
 
@@ -687,6 +714,7 @@ function broadcastControl(room, except, msg) {
 server.listen(PORT, HOST, () => {
   log(`listening on http://${HOST}:${PORT}`);
   if (DIST_DIR) log(`serving downloads from ${DIST_DIR} at /dl/`);
+  log(`minimum client: ${MIN_CLIENT}`);
   log(`identity providers: ${AUTH}${forgejoAuthEnabled ? ` (forgejo api ${FORGEJO_API})` : ''}`);
   log(`token auth: Ed25519 JWT${ephemeralKey ? ' (ephemeral key — tokens die with this process)' : ''}`);
   if (DEV_AUTH) log('DEV AUTH ENABLED — /v1/auth/dev mints tokens for any username');

@@ -49,6 +49,7 @@ export class EncryptedProvider extends EventEmitter {
     doc,
     awareness,
     allow,
+    clientVersion,
     // Injected so the same provider runs under node (the `ws` package, which can
     // set an Authorization header) and in a browser (native WebSocket, which
     // cannot — it passes the token as a subprotocol instead). Defaulting to the
@@ -72,6 +73,7 @@ export class EncryptedProvider extends EventEmitter {
     this._ownsAwareness = !awareness;
     this.awareness = awareness ?? new awarenessProtocol.Awareness(doc);
     this.allow = allow && allow.length ? allow : null;
+    this.clientVersion = clientVersion || null;
 
     this.key = null;
     this.ws = null;
@@ -128,7 +130,13 @@ export class EncryptedProvider extends EventEmitter {
     // The allowlist is applied by the relay at room creation, so it has to reach
     // it on the connect URL — usernames are authenticated, so this is the one
     // access check the relay can actually enforce.
-    return this.allow ? `${url}?allow=${encodeURIComponent(this.allow.join(','))}` : url;
+    const params = new URLSearchParams();
+    if (this.allow) params.set('allow', this.allow.join(','));
+    // Lets the relay refuse a client too old to speak its protocol, with a
+    // message naming the version rather than a puzzling failure later.
+    if (this.clientVersion) params.set('client', `tracker/${this.clientVersion}`);
+    const qs = params.toString();
+    return qs ? `${url}?${qs}` : url;
   }
 
   _open() {

@@ -19,6 +19,9 @@ import { previewScan, runSync } from './daemon.js';
 import { DEFAULT_EXCLUDE, DEFAULT_INCLUDE } from './config.js';
 import { CLI_CLIENT_ID, accountsUrlFor, channel, channelName } from './channel.js';
 import { browserLogin } from './oauth.js';
+import { roomKeyFor } from './room-keys.js';
+import { PROFILE_IDS, applySettings, detectIdes, profileById } from './ide.js';
+import { execFile } from 'node:child_process';
 import {
   ensureStateDir,
   listSessions,
@@ -34,7 +37,7 @@ import {
 const DEFAULT_RELAY = process.env.PF_RELAY || channel.relay;
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
-const VERSION = '0.1.3';
+const VERSION = '0.1.4';
 
 function parseArgs(argv) {
   const flags = {};
@@ -61,6 +64,7 @@ function requireAuth() {
 const relayFor = (flags, auth) => flags.relay || auth?.relay || DEFAULT_RELAY || null;
 
 const syncDefaults = (flags, root) => ({
+  clientVersion: VERSION,
   root: path.resolve(root),
   name: flags.name || os.userInfo().username || 'anon',
   include: DEFAULT_INCLUDE,
@@ -122,14 +126,15 @@ function findSessions(target, { root } = {}) {
 
 const KNOWN_FLAGS = {
   login: ['relay', 'forgejo-token', 'dev', 'git-host'],
+  '': ['relay', 'session', 'allow', 'name', 'yes', 'force', 'new-key', 'ide'],
   logout: [],
   whoami: [],
   version: [],
   status: [],
   stop: ['all', 'root'],
   logs: ['root', 'n', 'follow', 'f'],
-  share: ['relay', 'session', 'allow', 'name', 'detach', 'd', 'yes', 'force'],
-  join: ['relay', 'root', 'name', 'detach', 'd', 'yes', 'force'],
+  share: ['relay', 'session', 'allow', 'name', 'detach', 'd', 'yes', 'force', 'new-key', 'ide'],
+  join: ['relay', 'root', 'name', 'detach', 'd', 'yes', 'force', 'ide'],
   sync: [],
 };
 
@@ -234,6 +239,56 @@ function requireRelay(relay) {
   );
 }
 
+
+// Apply an IDE profile: editor-specific excludes, any settings the editor
+// actually supports, and honest guidance where it supports none. Entirely
+// optional — sync works with any editor because it happens at the filesystem.
+async function applyIdeProfile(root, flags) {
+  const requested = flags.ide;
+  if (requested === 'none') return { profiles: [], extraExclude: [] };
+
+  let profiles;
+  if (requested && requested !== true) {
+    const p = profileById(String(requested));
+    if (!p) die(`unknown --ide=${requested}. Known: ${PROFILE_IDS.join(', ')}, none`);
+    profiles = [p];
+  } else {
+    profiles = detectIdes(root);
+  }
+  if (!profiles.length) return { profiles: [], extraExclude: [] };
+
+  const extraExclude = profiles.flatMap((p) => p.exclude);
+  for (const p of profiles) {
+    console.log(`  ${p.label}`);
+    if (p.settings && requested) {
+      // Only written when the IDE was named explicitly — silently editing a
+      // project's editor settings on autodetect would be presumptuous.
+      const applied = await applySettings(root, p).catch(() => null);
+      if (applied?.changed?.length) {
+        console.log(`    wrote ${applied.changed.join(', ')} to ${p.settings.file}`);
+      }
+    } else if (p.settings) {
+      console.log(`    tip: --ide=${p.id} also enables autosave for near-instant sync`);
+    }
+    for (const note of p.notes) console.log(`    ${note}`);
+  }
+  return { profiles, extraExclude };
+}
+
+function copyToClipboard(text) {
+  const cmd = process.platform === 'darwin' ? 'pbcopy' : process.platform === 'win32' ? 'clip' : 'xclip';
+  const args = process.platform === 'linux' ? ['-selection', 'clipboard'] : [];
+  return new Promise((resolve) => {
+    try {
+      const child = execFile(cmd, args, () => resolve(false));
+      child.on('error', () => resolve(false));
+      child.stdin.end(text, () => resolve(true));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 // -- commands ---------------------------------------------------------------
 
 async function cmdLogin(flags) {
@@ -296,28 +351,75 @@ function cmdWhoami() {
   console.log(auth.username);
 }
 
-function cmdStatus() {
+async function cmdStatus() {
   const auth = loadAuth();
   console.log(`build:     ${VERSION} (${channelName})`);
   console.log(`logged in: ${auth?.username ? `yes (${auth.username})` : 'no'}`);
   console.log(`relay:     ${auth?.relay || DEFAULT_RELAY}`);
-  console.log(`config:    ${fs.existsSync('pf-sync.config.json') ? 'pf-sync.config.json' : 'none'}`);
 
   const sessions = listSessions();
-  if (!sessions.length) {
-    console.log('sessions:  none (start one with: tracker share <path> --detach)');
+  if (sessions.length) {
+    console.log('local:');
+    for (const x of sessions) {
+      const mins = Math.round((Date.now() - x.startedAt) / 60000);
+      console.log(
+        `  ${x.running ? '●' : '○'} ${x.owner}/${x.session}  ` +
+          `${x.running ? `running, pid ${x.pid}, up ${mins}m` : 'not running (stale)'}`,
+      );
+      console.log(`      root ${x.root}`);
+    }
+  } else {
+    console.log('local:     no sessions (start one with: tracker share <path>)');
+  }
+
+  // The local pid says a process exists; it cannot say whether anything is
+  // actually syncing. Ask the relay — that is the question people actually have,
+  // and answering it previously meant reading server logs.
+  if (!auth?.token) return;
+  let live = null;
+  try {
+    const httpBase = (auth.relay || DEFAULT_RELAY).replace(/^ws/, 'http').replace(/\/+$/, '');
+    const res = await fetch(`${httpBase}/v1/sessions`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) live = await res.json();
+  } catch {
+    console.log('relay:     unreachable — cannot show live peers');
     return;
   }
-  console.log('sessions:');
-  for (const x of sessions) {
-    const mins = Math.round((Date.now() - x.startedAt) / 60000);
-    const mark = x.running ? '●' : '○';
-    const state = x.running ? `running, pid ${x.pid}, up ${mins}m` : 'not running (stale)';
-    console.log(`  ${mark} ${x.owner}/${x.session}  ${state}`);
-    console.log(`      root ${x.root}`);
-  }
+  if (!live) return;
+
   console.log('');
-  console.log('Peer and sync detail lives in each session log: tracker logs <owner/session>');
+  if (!live.sessions.length) {
+    console.log('relay:     no live sessions for this account');
+    return;
+  }
+  console.log('live on the relay:');
+  for (const sess of live.sessions) {
+    console.log(`  ${sess.id}   ${sess.peerCount} peer${sess.peerCount === 1 ? '' : 's'}`);
+    for (const p of sess.peers) {
+      const idle = Math.round((live.now - p.lastActiveAt) / 1000);
+      console.log(
+        `      ${p.username.padEnd(20)} up ${fmtBytes(p.bytesIn)}  down ${fmtBytes(p.bytesOut)}` +
+          `   active ${idle}s ago`,
+      );
+    }
+    // The failure that is hardest to notice: connected, but to a session nobody
+    // else joined. Everything looks healthy and nothing syncs.
+    if (sess.peerCount === 1) {
+      const alone = Math.round((live.now - sess.peers[0].joinedAt) / 60000);
+      if (alone >= 2) {
+        console.log(
+          `      ⚠  alone here for ${alone}m — is your collaborator using this exact invite?`,
+        );
+      }
+    }
+  }
+  if (live.refusals?.length) {
+    const recent = live.refusals[live.refusals.length - 1];
+    console.log(`  ⚠  last refusal: ${recent.username} ${recent.code} ${recent.reason}`);
+  }
 }
 
 async function cmdStop(flags, positional) {
@@ -359,11 +461,21 @@ async function cmdShare(flags, positional) {
     die(`invalid session name: ${session} (use a-z, 0-9, -, max 39 chars)`);
   }
 
-  // A detached child inherits the parent's key through the environment so the
-  // invite stays stable and never appears in argv.
-  const roomKey = process.env.TRACKER_ROOM_KEY
-    ? fromBase64Url(process.env.TRACKER_ROOM_KEY)
-    : generateRoomKey();
+  // The key persists per project, so restarting a session — or the relay, or the
+  // laptop — keeps the same invite. Regenerating it every run meant a new
+  // sixty-character string had to be sent to the collaborator each time.
+  let roomKey;
+  let reusedKey = false;
+  if (process.env.TRACKER_ROOM_KEY) {
+    roomKey = fromBase64Url(process.env.TRACKER_ROOM_KEY);
+    reusedKey = true;
+  } else {
+    const got = await roomKeyFor(auth.username, session, path.resolve(root), {
+      rotate: Boolean(flags['new-key']),
+    });
+    roomKey = got.key;
+    reusedKey = got.reused;
+  }
   const invite = `${auth.username}/${session}#${toBase64Url(roomKey)}`;
   const relay = relayFor(flags, auth);
   const allow = flags.allow ? String(flags.allow).split(',').filter(Boolean) : null;
@@ -376,15 +488,27 @@ async function cmdShare(flags, positional) {
     console.log('  The part after # is the encryption key. It never reaches the relay,');
     console.log('  and anyone holding it can read and write this session — share it');
     console.log('  over a channel you trust.');
+    if (reusedKey) {
+      console.log('  (same invite as last time — it stays valid across restarts)');
+    } else if (flags['new-key']) {
+      console.log('  (new key — any previously shared invite no longer works)');
+    }
     if (allow) console.log(`  joins restricted to: ${allow.join(', ')}`);
     console.log('');
   }
 
+  const ide = await applyIdeProfile(root, flags);
   const shareCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
+  shareCfg.exclude = [...shareCfg.exclude, ...ide.extraExclude];
   // Before detaching, not after: the detached child skips preflight (the parent
   // is meant to have asked), so running it after the detach branch meant
   // background sessions were never checked at all.
   await preflight(shareCfg, flags);
+
+  if (!isDetachedChild()) {
+    const copied = await copyToClipboard(`tracker join ${invite}`);
+    if (copied) console.log('  (invite copied to your clipboard)');
+  }
 
   if (flags.detach && !isDetachedChild()) {
     return detach({
@@ -436,7 +560,9 @@ async function cmdJoin(flags, positional) {
   }
   const root = assertSafeRoot(flags.root || positional[1]);
 
+  const ide = await applyIdeProfile(root, flags);
   const joinCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
+  joinCfg.exclude = [...joinCfg.exclude, ...ide.extraExclude];
   await preflight(joinCfg, flags, { allowEmpty: true });
 
   if (flags.detach && !isDetachedChild()) {
@@ -452,6 +578,23 @@ async function cmdJoin(flags, positional) {
     token: auth.token,
     roomKey,
   });
+}
+
+// `tracker` with no arguments, run inside a project: the shortest path from
+// nothing to a live session. Signs in if needed, shares the current directory in
+// the background, and puts the invite on the clipboard.
+async function cmdDefault(flags) {
+  if (!fs.existsSync(path.join(process.cwd(), '.git')) && !flags.force) {
+    console.log('This does not look like a project directory (no .git here).');
+    console.log('Run it inside your project, or name one:  tracker share <path>');
+    return usage();
+  }
+  if (!loadAuth()?.token) {
+    console.log('Not signed in yet — opening your browser…\n');
+    await cmdLogin({});
+    console.log('');
+  }
+  return cmdShare({ ...flags, detach: true }, []);
 }
 
 async function cmdSync() {
@@ -477,11 +620,14 @@ function usage() {
       --allow=<user,...>               restrict joins by username
       --name=<label>                   display name for presence
       --detach                         run in the background, free the terminal
+      --new-key                        rotate the invite key for this project
+      --ide=<name|none>                xcode | vscode | visualstudio | jetbrains
 
   tracker join <owner/session#key>     attach to an existing session
       --root=<path>                    local directory to sync (required)
       --detach                         run in the background, free the terminal
 
+  tracker                              in a project: sign in, share, copy invite
   tracker version                      print version, build channel and relay
 
   tracker stop [owner/session]         stop a background session (--all for every one)
@@ -496,7 +642,7 @@ function usage() {
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { flags, positional } = parseArgs(rest);
-  if (cmd && KNOWN_FLAGS[cmd]) rejectUnknownFlags(cmd, flags);
+  rejectUnknownFlags(cmd ?? '', flags);
 
   switch (cmd) {
     case 'login':
@@ -524,8 +670,9 @@ async function main() {
     case 'help':
     case '--help':
     case '-h':
-    case undefined:
       return usage();
+    case undefined:
+      return cmdDefault(flags);
     default:
       console.error(`unknown command: ${cmd}\n`);
       usage();

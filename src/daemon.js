@@ -36,6 +36,7 @@ import picomatch from 'picomatch';
 
 import { detectEol, fromLf, platformEol, toLf } from './eol.js';
 import { EncryptedProvider } from './provider.js';
+import { notify } from './notify.js';
 
 // Transactions we originate from local disk carry this origin, so the CRDT
 // observer can tell "the other dev edited this" from "I just mirrored my own
@@ -507,9 +508,18 @@ export async function runSync(config) {
         .sort();
       const key = peers.join(',');
       if (key === lastPeers) return;
+      const previous = lastPeers ? lastPeers.split(',') : [];
       lastPeers = key;
-      if (peers.length) log(`👥 online with: ${peers.join(', ')}`);
-      else log('👥 no other collaborators online');
+      if (peers.length) {
+        log(`👥 online with: ${peers.join(', ')}`);
+        // A detached session logs to a file nobody reads, so the arrival of a
+        // collaborator is worth surfacing where it will be seen.
+        const arrived = peers.filter((p) => !previous.includes(p));
+        if (arrived.length) notify('ParaFrames Live', `${arrived.join(', ')} joined the session`);
+      } else {
+        log('👥 no other collaborators online');
+        if (previous.length) notify('ParaFrames Live', `${previous.join(', ')} left the session`);
+      }
     });
   }
 
@@ -555,6 +565,7 @@ export async function runSync(config) {
       token: config.token,
       roomKey: config.roomKey,
       allow: config.allow,
+      clientVersion: config.clientVersion,
       doc,
     });
     provider.on('status', ({ status, reason }) =>
@@ -569,6 +580,7 @@ export async function runSync(config) {
     );
     provider.on('fatal', ({ code, reason }) => {
       console.error(`[${stamp()}] ✖ ${reason} (${code})`);
+      notify('ParaFrames Live — session stopped', reason);
       process.exit(1);
     });
     await provider.connect();
