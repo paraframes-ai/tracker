@@ -231,7 +231,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
     return res.end(JSON.stringify({ error: 'too many requests' }));
   }
-  const isDownload = req.url?.startsWith('/dl');
+  const isDownload = req.url?.startsWith('/dl') || req.url === '/install.sh';
   if (isDownload && httpRateLimited(req, 'dl', HTTP_LIMITS.downloadPerMinute)) {
     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
     return res.end(JSON.stringify({ error: 'too many requests' }));
@@ -332,6 +332,22 @@ const server = http.createServer(async (req, res) => {
     return res.end(html);
   }
 
+
+  // The installer, at the root so `curl -fsSL <host>/install.sh | sh` works —
+  // which is the idiom people reach for, and doing it with a binary URL pipes a
+  // Mach-O into the shell and leaves no file behind.
+  if (req.method === 'GET' && req.url === '/install.sh' && DIST_DIR) {
+    try {
+      const sh = fs.readFileSync(path.join(DIST_DIR, 'install.sh'));
+      res.writeHead(200, {
+        'Content-Type': 'text/x-shellscript; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(sh);
+    } catch {
+      return sendJson(res, 404, { error: 'installer not published' });
+    }
+  }
 
   // Release binaries. Only bare filenames are accepted — no subdirectories and
   // no separators of any kind — so path traversal is impossible by construction
