@@ -22,15 +22,22 @@ export const channel =
   CHANNEL === 'public'
     ? {
         name: 'public',
-        // Deliberately no default relay. A binary from a public release should
-        // not silently connect to someone else's private infrastructure — their
-        // cost, their abuse surface, the user's code. `login` stores whichever
-        // relay is given, so --relay is needed once and then remembered.
-        relay: null,
+        // Points at the hosted relay so invited pilots need no extra flag.
+        //
+        // Note what this means: a binary downloaded from a public release
+        // connects to our infrastructure by default — our cost, our abuse
+        // surface, and the user's code passing through (encrypted, but through).
+        // That is a reasonable trade for a pilot cohort we invited. If this ever
+        // becomes a genuinely public release, revisit it: strangers who find the
+        // repo should have to opt in to someone else's server, not default into
+        // it. --relay overrides, and `login` remembers whatever it is given.
+        relay: 'wss://live.paraframes.org',
         web: 'https://github.com/paraframes-ai/tracker',
         dashboard: null,
         downloads: 'https://github.com/paraframes-ai/tracker/releases/latest',
-        accounts: null,
+        // Where a pilot gets a token. Derived from the relay origin would be
+        // wrong — identity lives on the git host, not the relay.
+        accounts: 'https://git.paraframes.org/user/settings/applications',
         docs: 'https://github.com/paraframes-ai/tracker#readme',
       }
     : {

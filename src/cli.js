@@ -33,7 +33,7 @@ import {
 const DEFAULT_RELAY = process.env.PF_RELAY || channel.relay;
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 
 function parseArgs(argv) {
   const flags = {};
