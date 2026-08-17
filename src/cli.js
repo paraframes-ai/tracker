@@ -15,8 +15,9 @@ import path from 'node:path';
 
 import { clearAuth, devLogin, forgejoLogin, loadAuth, login, readSecretFromStdin } from './auth.js';
 import { fromBase64Url, generateRoomKey, toBase64Url } from './crypto.js';
-import { runSync } from './daemon.js';
+import { previewScan, runSync } from './daemon.js';
 import { DEFAULT_EXCLUDE, DEFAULT_INCLUDE } from './config.js';
+import { accountsUrlFor, channel, channelName } from './channel.js';
 import {
   ensureStateDir,
   listSessions,
@@ -26,11 +27,13 @@ import {
   writeSession,
 } from './session-state.js';
 
-// The hosted relay. Override with --relay or PF_RELAY to point at a self-hosted
-// one; `tracker login` stores whichever was used, so later commands inherit it.
-const DEFAULT_RELAY = process.env.PF_RELAY || 'wss://live.paraframes.org';
+// Which relay to default to depends on the build channel: in-house builds point
+// at the company relay, public builds at nothing, so a binary from a public
+// release never silently connects to someone else's private infrastructure.
+const DEFAULT_RELAY = process.env.PF_RELAY || channel.relay;
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
+const VERSION = '0.1.1';
 
 function parseArgs(argv) {
   const flags = {};
@@ -54,7 +57,7 @@ function requireAuth() {
   return auth;
 }
 
-const relayFor = (flags, auth) => flags.relay || auth?.relay || DEFAULT_RELAY;
+const relayFor = (flags, auth) => flags.relay || auth?.relay || DEFAULT_RELAY || null;
 
 const syncDefaults = (flags, root) => ({
   root: path.resolve(root),
@@ -109,10 +112,126 @@ function findSessions(target, { root } = {}) {
   return matches;
 }
 
+
+// -- guards -----------------------------------------------------------------
+//
+// These exist because the defaults were dangerous: --root fell back to the
+// current directory, so `tracker join <invite>` typed in the wrong place synced
+// an entire home directory, in both directions, with no confirmation.
+
+const KNOWN_FLAGS = {
+  login: ['relay', 'forgejo-token', 'dev'],
+  logout: [],
+  whoami: [],
+  version: [],
+  status: [],
+  stop: ['all', 'root'],
+  logs: ['root', 'n', 'follow', 'f'],
+  share: ['relay', 'session', 'allow', 'name', 'detach', 'd', 'yes', 'force'],
+  join: ['relay', 'root', 'name', 'detach', 'd', 'yes', 'force'],
+  sync: [],
+};
+
+// An unknown flag used to be collected and ignored, so an old binary meeting a
+// new flag silently did something else entirely.
+function rejectUnknownFlags(cmd, flags) {
+  const known = KNOWN_FLAGS[cmd];
+  if (!known) return;
+  for (const f of Object.keys(flags)) {
+    if (!known.includes(f)) {
+      die(`unknown flag --${f} for "${cmd}". Known: ${known.map((k) => `--${k}`).join(', ') || 'none'}`);
+    }
+  }
+}
+
+// Roots that are never a project, and where syncing would expose personal files
+// or a whole machine.
+function assertSafeRoot(root) {
+  const abs = path.resolve(root);
+  const home = os.homedir();
+  const fsRoot = path.parse(abs).root;
+
+  if (abs === fsRoot) die(`refusing to sync the filesystem root (${abs})`);
+  if (abs === home) {
+    die(
+      `refusing to sync your home directory (${abs}).\n` +
+        '  Point --root at the project you mean:  --root=~/path/to/project',
+    );
+  }
+  // root is an ancestor of home: /Users, /home, /Users/you/.. and so on
+  if (home.startsWith(abs + path.sep)) {
+    die(`refusing to sync ${abs} — it contains your home directory`);
+  }
+  for (const bad of ['/Users', '/home', '/Volumes', '/etc', '/var', '/usr', '/System', '/Library']) {
+    if (abs === bad) die(`refusing to sync ${abs}`);
+  }
+  if (!fs.existsSync(abs)) die(`no such directory: ${abs}`);
+  if (!fs.statSync(abs).isDirectory()) die(`not a directory: ${abs}`);
+  return abs;
+}
+
+const fmtBytes = (n) =>
+  n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+
+function ask(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    process.stdin.setEncoding('utf8');
+    process.stdin.once('data', (d) => resolve(d.trim().toLowerCase()));
+    process.stdin.resume();
+  });
+}
+
+// Show exactly what is about to sync, and make the user agree to anything that
+// looks like a mistake. Skipped in the detached child — the parent already asked.
+const BIG_SESSION = 1000;
+
+async function preflight(cfg, flags) {
+  if (isDetachedChild()) return;
+  const scan = await previewScan(cfg);
+
+  console.log(`  ${scan.count} files (${fmtBytes(scan.bytes)}) from ${cfg.root}`);
+  console.log(
+    scan.gitAware
+      ? '  respecting .gitignore'
+      : '  not a git repo — using the built-in exclude list only',
+  );
+  if (scan.byTop.length) {
+    const top = scan.byTop.map(([name, n]) => `${name} (${n})`).join(', ');
+    console.log(`  top level: ${top}`);
+  }
+  console.log('');
+
+  if (scan.count === 0) {
+    die('nothing to sync here — check --root, or that this project has files matching the include list');
+  }
+  if (flags.yes || flags.force) return;
+  if (scan.count < BIG_SESSION) return;
+
+  if (!process.stdin.isTTY) {
+    die(`${scan.count} files is a lot — re-run with --yes if that is really intended`);
+  }
+  const answer = await ask(`  ${scan.count} files is a lot. Continue? [y/N] `);
+  if (answer !== 'y' && answer !== 'yes') {
+    console.log('  aborted');
+    process.exit(1);
+  }
+  process.stdin.pause();
+}
+
+function requireRelay(relay) {
+  if (relay) return relay;
+  die(
+    'this build has no default relay.\n' +
+      '  Pass --relay=wss://<host> on first login; it is remembered afterwards.\n' +
+      `  See ${channel.docs}`,
+  );
+}
+
 // -- commands ---------------------------------------------------------------
 
 async function cmdLogin(flags) {
-  const relay = relayFor(flags, null);
+  const relay = requireRelay(relayFor(flags, null));
 
   // Self-hosted identity: exchange a Forgejo access token. Prefer piping it in
   // so it stays out of argv (visible to `ps`) and out of shell history:
@@ -151,6 +270,13 @@ async function cmdLogout() {
   console.log('✓ logged out');
 }
 
+function cmdVersion() {
+  console.log(`tracker ${VERSION} (${channelName} build)`);
+  console.log(`relay:     ${DEFAULT_RELAY || '(none — pass --relay)'}`);
+  console.log(`downloads: ${channel.downloads}`);
+  console.log(`docs:      ${channel.docs}`);
+}
+
 function cmdWhoami() {
   const auth = loadAuth();
   if (!auth?.username) die('not logged in');
@@ -159,6 +285,7 @@ function cmdWhoami() {
 
 function cmdStatus() {
   const auth = loadAuth();
+  console.log(`build:     ${VERSION} (${channelName})`);
   console.log(`logged in: ${auth?.username ? `yes (${auth.username})` : 'no'}`);
   console.log(`relay:     ${auth?.relay || DEFAULT_RELAY}`);
   console.log(`config:    ${fs.existsSync('pf-sync.config.json') ? 'pf-sync.config.json' : 'none'}`);
@@ -212,8 +339,7 @@ function cmdLogs(flags, positional) {
 
 async function cmdShare(flags, positional) {
   const auth = requireAuth();
-  const root = positional[0] || process.cwd();
-  if (!fs.existsSync(root)) die(`no such directory: ${root}`);
+  const root = assertSafeRoot(positional[0] || process.cwd());
 
   const session = String(flags.session || path.basename(path.resolve(root))).toLowerCase();
   if (!NAME_RE.test(session)) {
@@ -241,6 +367,12 @@ async function cmdShare(flags, positional) {
     console.log('');
   }
 
+  const shareCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
+  // Before detaching, not after: the detached child skips preflight (the parent
+  // is meant to have asked), so running it after the detach branch meant
+  // background sessions were never checked at all.
+  await preflight(shareCfg, flags);
+
   if (flags.detach && !isDetachedChild()) {
     return detach({
       owner: auth.username,
@@ -252,8 +384,7 @@ async function cmdShare(flags, positional) {
   }
 
   await runSync({
-    ...syncDefaults(flags, root),
-    mode: 'e2e',
+    ...shareCfg,
     relay,
     owner: auth.username,
     session,
@@ -281,17 +412,27 @@ async function cmdJoin(flags, positional) {
     die(`bad invite key: ${err.message}`);
   }
 
-  const root = flags.root || positional[1] || process.cwd();
-  if (!fs.existsSync(root)) die(`no such directory: ${root}`);
+  // No cwd fallback. Defaulting a *joiner* to the current directory is how an
+  // entire home folder got synced: the joining side adopts the shared copy, so
+  // getting this wrong overwrites local files and uploads everything else.
+  if (!flags.root && !positional[1]) {
+    die(
+      'join requires --root=<path> — the local directory to sync into.\n' +
+        '  e.g. tracker join <invite> --root=~/Projects/myapp',
+    );
+  }
+  const root = assertSafeRoot(flags.root || positional[1]);
+
+  const joinCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
+  await preflight(joinCfg, flags);
 
   if (flags.detach && !isDetachedChild()) {
     return detach({ owner, session, root: path.resolve(root), relay: relayFor(flags, auth) });
   }
 
   await runSync({
-    ...syncDefaults(flags, root),
-    mode: 'e2e',
-    relay: relayFor(flags, auth),
+    ...joinCfg,
+    relay: requireRelay(relayFor(flags, auth)),
     owner,
     session,
     username: auth.username,
@@ -324,8 +465,10 @@ function usage() {
       --detach                         run in the background, free the terminal
 
   tracker join <owner/session#key>     attach to an existing session
-      --root=<path>                    local directory to sync
+      --root=<path>                    local directory to sync (required)
       --detach                         run in the background, free the terminal
+
+  tracker version                      print version, build channel and relay
 
   tracker stop [owner/session]         stop a background session (--all for every one)
   tracker logs [owner/session]         show a background session's log (-n=<lines>)
@@ -339,6 +482,7 @@ function usage() {
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const { flags, positional } = parseArgs(rest);
+  if (cmd && KNOWN_FLAGS[cmd]) rejectUnknownFlags(cmd, flags);
 
   switch (cmd) {
     case 'login':
@@ -347,6 +491,10 @@ async function main() {
       return cmdLogout();
     case 'whoami':
       return cmdWhoami();
+    case 'version':
+    case '--version':
+    case '-v':
+      return cmdVersion();
     case 'status':
       return cmdStatus();
     case 'stop':

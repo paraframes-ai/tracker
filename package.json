@@ -1,6 +1,6 @@
 {
   "name": "paraframes-live",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Real-time collaborative file sync for the ParaFrames SwiftUI app. A CRDT-based layer that lets two developers see each other's edits live while both keep using Xcode. Runs alongside git, not instead of it.",
   "type": "module",
   "engines": {
@@ -17,7 +17,9 @@
     "sync": "node src/pf-sync.js",
     "test": "node --test test/",
     "build:viewer": "bun build --target=browser src/browser/viewer.js --outfile src/server/viewer.bundle.js",
-    "build:git": "bun build --target=browser src/browser/git.js --outfile src/server/git.bundle.js"
+    "build:git": "bun build --target=browser src/browser/git.js --outfile src/server/git.bundle.js",
+    "build:internal": "bun build --compile --target=bun-darwin-arm64 src/cli.js --outfile dist/internal/tracker-darwin-arm64",
+    "build:public": "bun build --compile --define TRACKER_CHANNEL='\"public\"' --target=bun-darwin-arm64 src/cli.js --outfile dist/public/tracker-darwin-arm64"
   },
   "dependencies": {
     "chokidar": "^3.6.0",

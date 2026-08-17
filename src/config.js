@@ -14,33 +14,65 @@ import os from 'node:os';
 // Only these files are synced in real time. Everything else (project.pbxproj,
 // build output, images, ...) is left to git — char-level CRDT merging would
 // corrupt structured/binary files.
+// What syncs, by default.
+//
+// Two principles, so this works for any stack rather than the one it was written
+// for:
+//
+//  1. Include source *text* broadly. Character-level CRDT merging is safe for
+//     text and corrupts anything structured or binary.
+//  2. Delegate "what is build output" to .gitignore. Every project already
+//     declares that, correctly, for its own toolchain — Unity's Library/, Node's
+//     node_modules/, Python's __pycache__/, Rust's target/. Enumerating them here
+//     would mean guessing at ecosystems we have never seen, and getting it wrong
+//     both ways: syncing junk, or excluding a directory a project legitimately
+//     uses. See gitCandidates() in daemon.js.
 export const DEFAULT_INCLUDE = [
-  '**/*.swift',
-  '**/*.h',
-  '**/*.m',
-  '**/*.mm',
-  '**/*.c',
-  '**/*.cpp',
-  '**/*.json',
-  '**/*.md',
-  '**/*.txt',
-  '**/*.strings',
-  '**/*.metal',
-  '**/*.entitlements',
+  // systems / compiled
+  '**/*.swift', '**/*.h', '**/*.hpp', '**/*.hh', '**/*.m', '**/*.mm',
+  '**/*.c', '**/*.cc', '**/*.cpp', '**/*.cxx', '**/*.cs', '**/*.java',
+  '**/*.kt', '**/*.kts', '**/*.go', '**/*.rs', '**/*.scala', '**/*.dart',
+  '**/*.zig', '**/*.hs', '**/*.ml', '**/*.ex', '**/*.exs', '**/*.erl',
+  '**/*.clj', '**/*.cljs', '**/*.lua', '**/*.r', '**/*.jl',
+  // scripting / web
+  '**/*.js', '**/*.jsx', '**/*.mjs', '**/*.cjs', '**/*.ts', '**/*.tsx',
+  '**/*.vue', '**/*.svelte', '**/*.py', '**/*.rb', '**/*.php', '**/*.pl',
+  '**/*.sh', '**/*.bash', '**/*.zsh', '**/*.fish', '**/*.ps1',
+  '**/*.html', '**/*.htm', '**/*.css', '**/*.scss', '**/*.sass', '**/*.less',
+  // data / config / docs
+  '**/*.json', '**/*.jsonc', '**/*.yaml', '**/*.yml', '**/*.toml',
+  '**/*.ini', '**/*.cfg', '**/*.conf', '**/*.xml', '**/*.csv', '**/*.tsv',
+  '**/*.md', '**/*.mdx', '**/*.txt', '**/*.rst', '**/*.adoc',
+  '**/*.sql', '**/*.graphql', '**/*.gql', '**/*.proto',
+  '**/*.tf', '**/*.hcl', '**/*.gradle', '**/*.cmake',
+  // apple-specific text formats
+  '**/*.strings', '**/*.metal', '**/*.entitlements',
+  // common extensionless files
+  '**/Makefile', '**/Dockerfile', '**/CMakeLists.txt', '**/.editorconfig',
 ];
 
+// Deliberately short. Anything a project considers build output is handled by
+// .gitignore; this list is only for things no project should ever share live.
 export const DEFAULT_EXCLUDE = [
-  '**/.git/**',
-  '**/DerivedData/**',
-  '**/build/**',
-  '**/.build/**',
-  '**/Pods/**',
-  '**/xcuserdata/**',
-  '**/*.xcuserstate',
-  '**/.DS_Store',
-  '**/node_modules/**',
-  '**/project.pbxproj', // structured — let git own it
+  // version control internals
+  '**/.git/**', '**/.hg/**', '**/.svn/**',
+
+  // ours
   '**/.pf-sync-trash/**',
+
+  // OS noise
+  '**/.DS_Store', '**/Thumbs.db',
+
+  // Structured files a character-level merge would corrupt. Left to git on
+  // purpose — see the README.
+  '**/project.pbxproj',
+  '**/*.xcuserstate',
+
+  // Credentials. Excluded even when a project tracks them, because live-syncing
+  // a secret to a collaborator is worse than the inconvenience of it not syncing.
+  '**/.ssh/**', '**/.aws/**', '**/.gnupg/**', '**/.netrc',
+  '**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.keystore',
+  '**/.config/**',
 ];
 
 function parseCliFlags(argv) {
