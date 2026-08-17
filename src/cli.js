@@ -33,7 +33,7 @@ import {
 const DEFAULT_RELAY = process.env.PF_RELAY || channel.relay;
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 
 function parseArgs(argv) {
   const flags = {};
@@ -186,7 +186,7 @@ function ask(question) {
 // looks like a mistake. Skipped in the detached child — the parent already asked.
 const BIG_SESSION = 1000;
 
-async function preflight(cfg, flags) {
+async function preflight(cfg, flags, { allowEmpty = false } = {}) {
   if (isDetachedChild()) return;
   const scan = await previewScan(cfg);
 
@@ -203,7 +203,12 @@ async function preflight(cfg, flags) {
   console.log('');
 
   if (scan.count === 0) {
-    die('nothing to sync here — check --root, or that this project has files matching the include list');
+    // Empty is the normal case when joining: you join precisely to receive the
+    // other side's files. Only a *share* of nothing is a mistake.
+    if (!allowEmpty) {
+      die('nothing to sync here — check --root, or that this project has files matching the include list');
+    }
+    console.log('  (empty — files will arrive from the session)');
   }
   if (flags.yes || flags.force) return;
   if (scan.count < BIG_SESSION) return;
@@ -424,7 +429,7 @@ async function cmdJoin(flags, positional) {
   const root = assertSafeRoot(flags.root || positional[1]);
 
   const joinCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
-  await preflight(joinCfg, flags);
+  await preflight(joinCfg, flags, { allowEmpty: true });
 
   if (flags.detach && !isDetachedChild()) {
     return detach({ owner, session, root: path.resolve(root), relay: relayFor(flags, auth) });
