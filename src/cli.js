@@ -37,7 +37,7 @@ import {
 const DEFAULT_RELAY = process.env.PF_RELAY || channel.relay;
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
-const VERSION = '0.1.4';
+const VERSION = '0.1.5';
 
 function parseArgs(argv) {
   const flags = {};
@@ -126,15 +126,15 @@ function findSessions(target, { root } = {}) {
 
 const KNOWN_FLAGS = {
   login: ['relay', 'forgejo-token', 'dev', 'git-host'],
-  '': ['relay', 'session', 'allow', 'name', 'yes', 'force', 'new-key', 'ide'],
+  '': ['relay','session','allow','name','yes','force','new-key','ide','no-autosave'],
   logout: [],
   whoami: [],
   version: [],
   status: [],
   stop: ['all', 'root'],
   logs: ['root', 'n', 'follow', 'f'],
-  share: ['relay', 'session', 'allow', 'name', 'detach', 'd', 'yes', 'force', 'new-key', 'ide'],
-  join: ['relay', 'root', 'name', 'detach', 'd', 'yes', 'force', 'ide'],
+  share: ['relay','session','allow','name','detach','d','yes','force','new-key','ide','no-autosave'],
+  join: ['relay','root','name','detach','d','yes','force','ide','no-autosave'],
   sync: [],
 };
 
@@ -258,6 +258,9 @@ async function applyIdeProfile(root, flags) {
   if (!profiles.length) return { profiles: [], extraExclude: [] };
 
   const extraExclude = profiles.flatMap((p) => p.exclude);
+  // At most one editor needs driving; if a repo matches two, the one that
+  // declares an autosave mechanism wins.
+  const autosave = flags['no-autosave'] ? null : (profiles.find((p) => p.autosave)?.autosave ?? null);
   for (const p of profiles) {
     console.log(`  ${p.label}`);
     if (p.settings && requested) {
@@ -270,9 +273,13 @@ async function applyIdeProfile(root, flags) {
     } else if (p.settings) {
       console.log(`    tip: --ide=${p.id} also enables autosave for near-instant sync`);
     }
-    for (const note of p.notes) console.log(`    ${note}`);
+    if (p.autosave && flags['no-autosave']) {
+      console.log('    autosave disabled (--no-autosave); changes propagate when you save');
+    } else {
+      for (const note of p.notes) console.log(`    ${note}`);
+    }
   }
-  return { profiles, extraExclude };
+  return { profiles, extraExclude, autosave };
 }
 
 function copyToClipboard(text) {
@@ -500,6 +507,7 @@ async function cmdShare(flags, positional) {
   const ide = await applyIdeProfile(root, flags);
   const shareCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
   shareCfg.exclude = [...shareCfg.exclude, ...ide.extraExclude];
+  shareCfg.autosave = ide.autosave;
   // Before detaching, not after: the detached child skips preflight (the parent
   // is meant to have asked), so running it after the detach branch meant
   // background sessions were never checked at all.
@@ -563,6 +571,7 @@ async function cmdJoin(flags, positional) {
   const ide = await applyIdeProfile(root, flags);
   const joinCfg = { ...syncDefaults(flags, root), mode: 'e2e' };
   joinCfg.exclude = [...joinCfg.exclude, ...ide.extraExclude];
+  joinCfg.autosave = ide.autosave;
   await preflight(joinCfg, flags, { allowEmpty: true });
 
   if (flags.detach && !isDetachedChild()) {
@@ -622,6 +631,7 @@ function usage() {
       --detach                         run in the background, free the terminal
       --new-key                        rotate the invite key for this project
       --ide=<name|none>                xcode | vscode | visualstudio | jetbrains
+      --no-autosave                    do not drive the editor to save
 
   tracker join <owner/session#key>     attach to an existing session
       --root=<path>                    local directory to sync (required)

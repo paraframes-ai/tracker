@@ -37,6 +37,7 @@ import picomatch from 'picomatch';
 import { detectEol, fromLf, platformEol, toLf } from './eol.js';
 import { EncryptedProvider } from './provider.js';
 import { notify } from './notify.js';
+import { startAutosave } from './autosave.js';
 
 // Transactions we originate from local disk carry this origin, so the CRDT
 // observer can tell "the other dev edited this" from "I just mirrored my own
@@ -598,8 +599,15 @@ export async function runSync(config) {
   await reconcile();
   watch();
 
+  // Some editors hold unsaved text indefinitely, which makes them invisible to a
+  // filesystem watcher. Where one can be asked to save, ask it.
+  const stopAutosave = config.autosave
+    ? startAutosave({ ide: config.autosave, log, warn })
+    : () => {};
+
   const shutdown = () => {
     log('shutting down');
+    stopAutosave();
     provider.destroy();
     process.exit(0);
   };

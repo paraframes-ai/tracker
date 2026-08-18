@@ -5,10 +5,15 @@
 // which of its scratch files should never sync, and, where the editor allows it,
 // making it write to disk promptly so changes actually propagate.
 //
-// Be honest about what each can do. VS Code and its forks expose an autosave
-// setting, so a profile genuinely makes them near-real-time. Xcode does not
-// expose one at all, so its profile is excludes plus accurate guidance — dressing
-// that up as "Xcode support" would be a lie the user discovers within a minute.
+// Be honest about what each can do, because the mechanism differs per editor:
+//
+//   VS Code family  a real autosave setting, written into .vscode/settings.json
+//   JetBrains       already autosaves; nothing to do but exclude its scratch
+//   Xcode           no setting exists, so it is driven to save via Apple Events
+//   Visual Studio   writes on build and focus change; no per-project setting
+//
+// Claiming uniform "IDE support" would be a lie each user discovers within a
+// minute of trying it, so each profile states its own mechanism and limits.
 
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -21,10 +26,16 @@ const VSCODE_FAMILY = {
   id: 'vscode',
   label: 'VS Code (and forks: Cursor, Windsurf, Antigravity, VSCodium)',
   detect: (root) =>
-    fs.existsSync(path.join(root, '.vscode')) ||
-    fs.existsSync(path.join(root, '.cursor')) ||
-    fs.existsSync(path.join(root, '.windsurf')),
-  exclude: ['**/.vscode/**', '**/.history/**', '**/.idea/**'],
+    ['.vscode', '.cursor', '.windsurf', '.antigravity', '.trae', '.zed'].some((d) =>
+      fs.existsSync(path.join(root, d)),
+    ),
+  exclude: [
+    '**/.vscode/**',
+    '**/.cursor/**',
+    '**/.windsurf/**',
+    '**/.antigravity/**',
+    '**/.history/**',
+  ],
   // The setting that matters: without it the editor holds the buffer and nothing
   // propagates until a manual save.
   settings: {
@@ -54,14 +65,20 @@ const XCODE = {
     '**/*.xcscmblueprint',
     '**/*.xccheckout',
     '**/.swiftpm/**',
+    '**/Package.resolved',
   ],
-  settings: null, // Xcode has no autosave preference for source files. None.
+  // Xcode has no autosave preference, so there is nothing to write into a
+  // settings file. Instead it is driven to save via its own scripting
+  // dictionary — see src/autosave.js for why Apple Events rather than
+  // synthetic keystrokes.
+  settings: null,
+  autosave: 'xcode',
   notes: [
-    'Xcode has no autosave setting, so it writes to disk only on ⌘S or a build.',
-    'Your edits reach collaborators when you save; theirs land on disk immediately',
-    'but Xcode may keep showing its own buffer until the file is reopened.',
-    'Editing a file you have unsaved changes in is safe — overlapping edits are',
-    'merged rather than overwritten — but ⌘S often is the smoothest habit.',
+    'Xcode has no autosave setting, so tracker asks it to save every 2s instead.',
+    'macOS will prompt once to allow controlling Xcode (Automation, not',
+    'Accessibility — it authorises this one pairing, not control of your machine).',
+    'Decline it and everything still works; changes then propagate on ⌘S or a build.',
+    'Disable with --no-autosave.',
   ],
 };
 
@@ -79,13 +96,48 @@ const VISUAL_STUDIO = {
   ],
 };
 
+// One profile for the whole family — IntelliJ, Rider, PyCharm, WebStorm, CLion,
+// GoLand, PhpStorm, RubyMine, AppCode, Android Studio — since they share the
+// .idea project layout and the same save behaviour.
 const JETBRAINS = {
   id: 'jetbrains',
-  label: 'JetBrains (Rider, IntelliJ, AppCode)',
-  detect: (root) => fs.existsSync(path.join(root, '.idea')),
-  exclude: ['**/.idea/**', '**/out/**', '**/*.iml'],
-  settings: null, // JetBrains IDEs already autosave aggressively by default
-  notes: ['JetBrains IDEs autosave by default, so changes propagate without any setup.'],
+  label: 'JetBrains (IntelliJ, Rider, PyCharm, WebStorm, CLion, GoLand, Android Studio)',
+  detect: (root) => {
+    if (fs.existsSync(path.join(root, '.idea'))) return true;
+    try {
+      return fs.readdirSync(root).some((n) => n.endsWith('.iml') || n.endsWith('.ipr'));
+    } catch {
+      return false;
+    }
+  },
+  exclude: [
+    // Project metadata: per-developer, and workspace.xml churns constantly.
+    '**/.idea/**',
+    '**/*.iml',
+    '**/*.ipr',
+    '**/*.iws',
+    // Build output across the JVM/.NET/Android toolchains these IDEs drive.
+    '**/out/**',
+    '**/.gradle/**',
+    '**/build/**',
+    '**/target/**',
+    '**/bin/Debug/**',
+    '**/bin/Release/**',
+    '**/obj/Debug/**',
+    '**/obj/Release/**',
+    '**/.mvn/**',
+    // Local Android/Gradle settings that are machine-specific.
+    '**/local.properties',
+    '**/captures/**',
+  ],
+  settings: null,
+  // JetBrains IDEs already write to disk on their own, so nothing needs driving.
+  notes: [
+    'JetBrains IDEs autosave, so changes propagate without any setup: they save',
+    'after ~15s idle and whenever you switch to another app.',
+    'For faster sync, lower Settings → Appearance & Behavior → System Settings →',
+    '"Save files if the IDE is idle for N seconds".',
+  ],
 };
 
 export const PROFILES = [VSCODE_FAMILY, XCODE, VISUAL_STUDIO, JETBRAINS];
